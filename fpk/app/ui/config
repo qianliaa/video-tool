@@ -1,7 +1,7 @@
 {
     ".url": {
         "video-tool.Application": {
-            "title": "{display_name}",
+            "title": "视频助手",
             "icon": "images/icon_{0}.png",
             "type": "url",
             "protocol": "http",

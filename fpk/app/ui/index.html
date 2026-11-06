@@ -1,179 +1,674 @@
-﻿<!DOCTYPE html>
-<html lang="zh-CN">
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Video Tool</title>
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
-    max-width: 960px; margin: 0 auto; padding: 24px 16px 60px;
-    color: #222; background: #fafafa;
-  }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: #888; font-size: 13px; margin-bottom: 20px; }
-  .card {
-    background: #fff; border: 1px solid #e5e5e5; border-radius: 8px;
-    padding: 18px; margin-bottom: 18px;
-  }
-  .card h2 { font-size: 15px; margin: 0 0 12px; color: #0078d7; }
-  select, input[type=text] {
-    width: 100%; padding: 7px 9px; border: 1px solid #ccc;
-    border-radius: 5px; font-size: 13px; font-family: inherit;
-  }
-  select[multiple] { height: 180px; font-family: Consolas, monospace; }
-  label { font-size: 13px; }
-  .row { margin: 10px 0; }
-  .hint { color: #999; font-size: 12px; margin-top: 4px; }
-  button {
-    background: #0078d7; color: #fff; border: none; padding: 9px 22px;
-    border-radius: 5px; font-size: 14px; cursor: pointer; font-family: inherit;
-  }
-  button:hover { background: #0060b0; }
-  button:disabled { background: #bbb; cursor: not-allowed; }
-  #log {
-    background: #1e1e1e; color: #d4d4d4; border-radius: 6px;
-    height: 260px; overflow: auto; padding: 12px;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
-  }
-  .status { font-size: 12px; margin-left: 10px; }
-  .status.running { color: #f0a020; }
-  .status.done { color: #2e9e44; }
-  .status.failed { color: #d93025; }
-  .toolbar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>视频助手</title>
+<meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0f14" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
+<link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
+<link rel="stylesheet" href="style.css?v=1.3.0">
 </head>
 <body>
+<div class="app">
 
-<h1>Video Tool</h1>
-<div class="sub">视频合并与下载 · 基于 ffmpeg + yt-dlp</div>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      </div>
+      <div class="brand-text">
+        <strong>视频助手</strong>
+        <span>ffmpeg 视频工作站</span>
+      </div>
+    </div>
 
-<div class="card">
-  <h2>视频合并</h2>
-  <label>媒体目录中的文件（可 Ctrl / Shift 多选，按列表顺序拼接）：</label>
-  <div class="row"><select id="files" multiple></select></div>
-  <div class="toolbar">
-    <button onclick="refreshFiles()">刷新列表</button>
-    <span class="hint" id="fileCount"></span>
-  </div>
-  <div class="row" style="margin-top:14px">
-    <label>输出文件名（相对媒体目录，如 out/result.mkv）：</label>
-    <input type="text" id="outname" value="merged.mkv">
-  </div>
-  <div class="row">
-    <label><input type="checkbox" id="reen"> 强制重新编码（不同来源/编码不一致时勾选，速度较慢但可靠）</label>
-    <div class="hint">不勾选 = 无损复制（-c copy），速度快；勾选 = 统一转 H.264 + AAC</div>
-  </div>
-  <button id="btnMerge" onclick="doMerge()">开始合并</button>
+    <nav class="nav">
+      <button class="nav-item" data-view="merge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/></svg>
+        <span>合并</span>
+      </button>
+      <button class="nav-item" data-view="process">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11a4 4 0 1 1 0 8H8"/><polyline points="7 4 4 7 7 10"/><path d="M20 17H9a4 4 0 1 1 0-8h7"/><polyline points="17 14 20 17 17 20"/></svg>
+        <span>转换</span>
+      </button>
+      <button class="nav-item" data-view="clip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+        <span>剪辑</span>
+      </button>
+      <button class="nav-item" data-view="audio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        <span>音频</span>
+      </button>
+      <button class="nav-item" data-view="subtitle">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 12h6M6 16h10M14 12h4"/></svg>
+        <span>字幕</span>
+      </button>
+      <button class="nav-item" data-view="download">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        <span>下载</span>
+      </button>
+      <button class="nav-item" data-view="advanced">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span>高级</span>
+      </button>
+      <button class="nav-item" data-view="tasks">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>
+        <span>任务</span>
+        <em class="nav-badge" id="taskBadge" hidden>0</em>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.73.85.3.2.66.3 1.02.3H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>设置</span>
+      </button>
+    </nav>
+
+    <div class="side-foot">
+      <button class="btn ghost small block" id="sideSettings">目录与设置</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1 id="viewTitle">视频合并</h1>
+        <p id="viewDesc">按顺序拼接多个视频，保持原有画质</p>
+      </div>
+      <div class="top-actions">
+        <span class="chip" id="chipFfmpeg"><i class="dot"></i>ffmpeg 检测中</span>
+        <button class="icon-btn" id="themeBtn" title="切换主题">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="dirtop">
+      <button class="dir-pill" data-pick="input" title="点击更换输入目录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span class="dir-pill-label">输入</span>
+        <span class="dir-pill-path" id="inputPath">-</span>
+      </button>
+      <button class="dir-pill" data-pick="output" title="点击更换输出目录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><polyline points="12 11 12 17"/><polyline points="9 14 12 17 15 14"/></svg>
+        <span class="dir-pill-label">输出</span>
+        <span class="dir-pill-path" id="outputPath">-</span>
+      </button>
+      <button class="btn ghost small" id="refreshAll" title="重新读取输入目录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        刷新
+      </button>
+    </div>
+
+    <div class="setup-banner" id="setupBanner" hidden>
+      <div class="setup-text">
+        <strong>先设置工作目录</strong>
+        <span id="setupHint">输入目录用于读取视频，输出目录用于保存结果。可直接粘贴文件管理中的原始路径。</span>
+      </div>
+      <div class="setup-actions">
+        <button class="btn ghost small" data-pick="input">设置输入</button>
+        <button class="btn ghost small" data-pick="output">设置输出</button>
+      </div>
+    </div>
+
+    <!-- ============ 合并 ============ -->
+    <section class="view" data-view="merge" hidden>
+      <div class="grid-2 wide-left">
+        <div class="card">
+          <div class="card-head">
+            <h2>输入文件 <span class="badge" id="mergeFileCount">0</span></h2>
+            <div class="head-tools">
+              <input class="search" id="mergeSearch" type="text" placeholder="搜索文件…">
+            </div>
+          </div>
+          <div class="file-list" id="mergeFiles"></div>
+          <div class="empty" id="mergeEmpty" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 9l5 3-5 3z"/></svg>
+            <p>输入目录中没有视频或音频文件</p>
+            <button class="btn ghost small" data-pick="input">更换输入目录</button>
+          </div>
+        </div>
+
+        <div class="card sticky">
+          <div class="card-head">
+            <h2>拼接顺序 <span class="badge" id="mergeSelCount">0</span></h2>
+            <button class="btn ghost small" id="mergeClear">清空</button>
+          </div>
+          <ol class="selected-list" id="mergeSelected"></ol>
+          <div class="empty small" id="mergeSelEmpty">
+            <p>点击左侧文件加入列表<br>使用 ↑ ↓ 调整顺序</p>
+          </div>
+          <div class="field">
+            <label for="mergeOutput">输出文件名</label>
+            <input id="mergeOutput" type="text" value="merged.mkv">
+          </div>
+          <label class="switch-row">
+            <input type="checkbox" id="mergeReencode">
+            <span class="switch"></span>
+            <div><strong>重新编码</strong><small>各片段编码不一致时勾选，速度较慢但兼容性最好</small></div>
+          </label>
+          <div class="path-preview" id="mergePreview">输出：-</div>
+          <button class="btn primary block" id="mergeRun">开始合并</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 转换 ============ -->
+    <section class="view" data-view="process" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>视频转换与处理</h2>
+          <div class="seg" id="processSeg">
+            <button data-sub="convert" class="active">格式转换</button>
+            <button data-sub="compress">压缩</button>
+            <button data-sub="resize">分辨率</button>
+            <button data-sub="rotate">旋转</button>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="processFile">源文件</label>
+            <select id="processFile" class="file-select" data-kind="video"></select>
+          </div>
+          <div class="field">
+            <label for="processOutput">输出文件名</label>
+            <input id="processOutput" type="text" value="output.mp4">
+          </div>
+        </div>
+
+        <div class="sub-panel" data-sub="convert">
+          <div class="field">
+            <label>目标格式</label>
+            <div class="chips pick" id="convertFormats">
+              <button data-ext="mp4" class="active">MP4</button>
+              <button data-ext="mkv">MKV</button>
+              <button data-ext="mov">MOV</button>
+              <button data-ext="webm">WEBM</button>
+              <button data-ext="avi">AVI</button>
+              <button data-ext="mp3">MP3（仅音频）</button>
+              <button data-ext="m4a">M4A（仅音频）</button>
+              <button data-ext="wav">WAV（仅音频）</button>
+              <button data-ext="flac">FLAC（仅音频）</button>
+            </div>
+          </div>
+          <label class="switch-row compact">
+            <input type="checkbox" id="convertCopy">
+            <span class="switch"></span>
+            <div><strong>仅封装（不重新编码）</strong><small>仅适用于封装格式转换，速度快；后缀不兼容时可能失败</small></div>
+          </label>
+        </div>
+
+        <div class="sub-panel" data-sub="compress" hidden>
+          <div class="form-grid three">
+            <div class="field">
+              <label for="compressCrf">画质 CRF <span class="value" id="crfValue">23</span></label>
+              <input id="compressCrf" type="range" min="0" max="51" value="23" step="1">
+              <p class="hint">数值越小画质越好、体积越大；18–28 为常用区间</p>
+            </div>
+            <div class="field">
+              <label for="compressPreset">编码速度</label>
+              <select id="compressPreset">
+                <option value="veryfast">很快</option>
+                <option value="fast">快</option>
+                <option value="medium" selected>均衡</option>
+                <option value="slow">慢（更小体积）</option>
+                <option value="slower">更慢</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="compressScale">缩放（可选）</label>
+              <input id="compressScale" type="text" placeholder="例如 1280:-2 或 1920:1080">
+            </div>
+          </div>
+        </div>
+
+        <div class="sub-panel" data-sub="resize" hidden>
+          <div class="form-grid three">
+            <div class="field">
+              <label for="resizeWidth">宽度</label>
+              <input id="resizeWidth" type="number" min="0" placeholder="例如 1920，留空则按高度等比">
+            </div>
+            <div class="field">
+              <label for="resizeHeight">高度</label>
+              <input id="resizeHeight" type="number" min="0" placeholder="例如 1080">
+            </div>
+            <div class="field">
+              <label>常用分辨率</label>
+              <div class="chips pick" id="resizePresets">
+                <button data-w="3840" data-h="2160">4K</button>
+                <button data-w="1920" data-h="1080">1080p</button>
+                <button data-w="1280" data-h="720">720p</button>
+                <button data-w="854" data-h="480">480p</button>
+              </div>
+            </div>
+          </div>
+          <p class="hint">宽高都填写时会等比缩放并适配到框内；只填一边则另一边自动计算。</p>
+        </div>
+
+        <div class="sub-panel" data-sub="rotate" hidden>
+          <div class="form-grid">
+            <div class="field">
+              <label for="rotateDir">旋转 / 翻转</label>
+              <select id="rotateDir">
+                <option value="90">顺时针 90°</option>
+                <option value="270">逆时针 90°</option>
+                <option value="180">旋转 180°</option>
+                <option value="flip_h">水平翻转</option>
+                <option value="flip_v">垂直翻转</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="path-preview" id="processPreview">输出：-</div>
+        <button class="btn primary block" id="processRun">开始处理</button>
+      </div>
+    </section>
+
+    <!-- ============ 剪辑 ============ -->
+    <section class="view" data-view="clip" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>剪辑与截图</h2>
+          <div class="seg" id="clipSeg">
+            <button data-sub="trim" class="active">截取片段</button>
+            <button data-sub="screenshot">视频截图</button>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="clipFile">源文件</label>
+            <select id="clipFile" class="file-select" data-kind="video"></select>
+          </div>
+          <div class="field">
+            <label for="clipOutput">输出文件名</label>
+            <input id="clipOutput" type="text" value="clip.mkv">
+          </div>
+        </div>
+
+        <div class="sub-panel" data-sub="trim">
+          <div class="form-grid three">
+            <div class="field">
+              <label for="trimStart">开始时间</label>
+              <input id="trimStart" type="text" placeholder="00:01:30 或 90">
+            </div>
+            <div class="field">
+              <label for="trimDuration">持续时长</label>
+              <input id="trimDuration" type="text" placeholder="00:00:30 或 30">
+            </div>
+            <div class="field">
+              <label>模式</label>
+              <label class="switch-row compact inline">
+                <input type="checkbox" id="trimCopy" checked>
+                <span class="switch"></span>
+                <div><strong>无损截取</strong><small>不重新编码，起点会对齐关键帧</small></div>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="sub-panel" data-sub="screenshot" hidden>
+          <div class="form-grid">
+            <div class="field">
+              <label for="shotTime">截图时间点</label>
+              <input id="shotTime" type="text" placeholder="00:00:10">
+            </div>
+            <div class="field">
+              <label for="shotFormat">图片格式</label>
+              <select id="shotFormat">
+                <option value="jpg">JPG</option>
+                <option value="png">PNG</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="path-preview" id="clipPreview">输出：-</div>
+        <button class="btn primary block" id="clipRun">开始处理</button>
+      </div>
+    </section>
+
+    <!-- ============ 音频 ============ -->
+    <section class="view" data-view="audio" hidden>
+      <div class="card">
+        <div class="card-head"><h2>提取音频</h2></div>
+        <div class="form-grid">
+          <div class="field">
+            <label for="audioFile">源文件</label>
+            <select id="audioFile" class="file-select" data-kind="media"></select>
+          </div>
+          <div class="field">
+            <label for="audioOutput">输出文件名</label>
+            <input id="audioOutput" type="text" value="audio.mp3">
+          </div>
+        </div>
+        <div class="field">
+          <label>音频格式</label>
+          <div class="chips pick" id="audioFormats">
+            <button data-ext="mp3" class="active">MP3</button>
+            <button data-ext="m4a">M4A</button>
+            <button data-ext="aac">AAC</button>
+            <button data-ext="wav">WAV</button>
+            <button data-ext="flac">FLAC</button>
+            <button data-ext="opus">OPUS</button>
+            <button data-ext="ogg">OGG</button>
+          </div>
+        </div>
+        <div class="path-preview" id="audioPreview">输出：-</div>
+        <button class="btn primary block" id="audioRun">提取音频</button>
+      </div>
+    </section>
+
+    <!-- ============ 字幕 ============ -->
+    <section class="view" data-view="subtitle" hidden>
+      <div class="card">
+        <div class="card-head"><h2>字幕烧录</h2></div>
+        <div class="form-grid">
+          <div class="field">
+            <label for="subFileVideo">视频文件</label>
+            <select id="subFileVideo" class="file-select" data-kind="video"></select>
+          </div>
+          <div class="field">
+            <label for="subFileSub">字幕文件（srt / ass / ssa / vtt）</label>
+            <select id="subFileSub" class="file-select" data-kind="subtitle"></select>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label for="subOutput">输出文件名</label>
+            <input id="subOutput" type="text" value="subtitled.mp4">
+          </div>
+          <div class="field">
+            <label for="subFontSize">字号（可选）</label>
+            <input id="subFontSize" type="number" min="8" max="120" placeholder="24">
+          </div>
+        </div>
+        <p class="hint">字幕将直接烧录进画面，需要重新编码视频。ASS 字幕的样式会被保留。</p>
+        <div class="path-preview" id="subPreview">输出：-</div>
+        <button class="btn primary block" id="subRun">开始烧录</button>
+      </div>
+    </section>
+
+    <!-- ============ 下载 ============ -->
+    <section class="view" data-view="download" hidden>
+      <div class="card narrow-card">
+        <div class="card-head">
+          <div>
+            <h2>链接下载</h2>
+            <p class="card-sub">使用 ffmpeg 直接读取直链、HLS 或 DASH 媒体</p>
+          </div>
+          <span class="soft-tag">ffmpeg 原生</span>
+        </div>
+
+        <div class="field">
+          <label for="dlUrl">视频地址</label>
+          <input id="dlUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+                 placeholder="https://… 直链 / m3u8 / mpd / 视频页面">
+          <p class="hint">支持公开直链、HLS(m3u8)、DASH(mpd) 以及页面内的媒体地址。需要登录或加密解析的站点不支持。</p>
+        </div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label>下载类型</label>
+            <div class="seg small" id="dlMode">
+              <button data-mode="video" class="active">视频</button>
+              <button data-mode="audio">仅音频</button>
+            </div>
+          </div>
+          <div class="field" id="dlQualityWrap">
+            <label for="dlQuality">画质</label>
+            <select id="dlQuality">
+              <option value="best">最佳（自动）</option>
+              <option value="2160">4K · 2160p</option>
+              <option value="1440">2K · 1440p</option>
+              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+              <option value="480">480p</option>
+              <option value="worst">最低</option>
+            </select>
+          </div>
+          <div class="field" id="dlAudioFormatWrap" hidden>
+            <label for="dlAudioFormat">音频格式</label>
+            <select id="dlAudioFormat">
+              <option value="mp3">MP3</option>
+              <option value="m4a">M4A</option>
+              <option value="aac">AAC</option>
+              <option value="wav">WAV</option>
+              <option value="flac">FLAC</option>
+              <option value="opus">OPUS</option>
+              <option value="ogg">OGG</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="dlFilename">保存文件名（可选）</label>
+            <input id="dlFilename" type="text" placeholder="留空自动命名" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="dlSubdir">保存子目录（可选）</label>
+            <input id="dlSubdir" type="text" placeholder="相对输出目录，可留空">
+          </div>
+        </div>
+
+        <details class="adv">
+          <summary>网络选项</summary>
+          <div class="adv-body">
+            <div class="form-grid">
+              <div class="field">
+                <label for="dlProxy">代理（可选）</label>
+                <input id="dlProxy" type="text" placeholder="http://127.0.0.1:7890">
+              </div>
+              <div class="field">
+                <label for="dlReferer">Referer（可选）</label>
+                <input id="dlReferer" type="text" placeholder="来源页面地址">
+              </div>
+            </div>
+            <div class="field">
+              <label for="dlHeaders">附加请求头（可选）</label>
+              <textarea id="dlHeaders" rows="2" spellcheck="false" placeholder="Cookie: ...&#10;Authorization: ..."></textarea>
+            </div>
+          </div>
+        </details>
+
+        <div class="path-preview" id="dlPreview">保存至：-</div>
+        <button class="btn primary block" id="dlRun">开始下载</button>
+      </div>
+    </section>
+
+    <!-- ============ 高级 ============ -->
+    <section class="view" data-view="advanced" hidden>
+      <div class="card">
+        <div class="card-head"><h2>自定义 ffmpeg 命令</h2></div>
+        <p class="hint" style="margin-top:0">参数中可使用 <code>{input}</code> 和 <code>{output}</code> 占位符；不填写时自动补全输入与输出。命令由服务器执行，请只运行可信参数。</p>
+        <div class="form-grid">
+          <div class="field">
+            <label for="customFile">输入文件</label>
+            <select id="customFile" class="file-select" data-kind="media"></select>
+          </div>
+          <div class="field">
+            <label for="customOutput">输出文件名</label>
+            <input id="customOutput" type="text" value="custom-output.mkv">
+          </div>
+        </div>
+        <div class="field">
+          <label for="customArgs">ffmpeg 参数</label>
+          <textarea id="customArgs" rows="4" spellcheck="false" placeholder="-i {input} -vf scale=1280:-2 -c:v libx264 -crf 23 {output}"></textarea>
+        </div>
+        <div class="path-preview" id="customPreview">输出：-</div>
+        <button class="btn primary block" id="customRun">执行命令</button>
+      </div>
+    </section>
+
+    <!-- ============ 任务 ============ -->
+    <section class="view" data-view="tasks" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>任务列表</h2>
+          <button class="btn ghost small" id="tasksRefresh">刷新</button>
+        </div>
+        <div id="taskList" class="task-list"></div>
+        <div class="empty" id="tasksEmpty" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+          <p>暂无任务</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="view" data-view="settings" hidden>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>目录设置</h2></div>
+          <div class="field">
+            <label for="setInput">输入目录（读取媒体文件）</label>
+            <div class="input-with-btn">
+              <input id="setInput" type="text" placeholder="/vol1/1000/视频" spellcheck="false">
+              <button class="btn ghost" data-pick="input">浏览</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="setOutput">输出目录（保存处理结果）</label>
+            <div class="input-with-btn">
+              <input id="setOutput" type="text" placeholder="/vol1/1000/输出" spellcheck="false">
+              <button class="btn ghost" data-pick="output">浏览</button>
+            </div>
+          </div>
+          <button class="btn primary block" id="setSave">保存目录设置</button>
+          <p class="hint">可直接粘贴「文件管理」中复制的原始路径，例如 <code>/vol1/1000/视频</code>。保存时会自动检查读写权限。</p>
+          <div class="notice">
+            <strong>在应用里看不到文件夹？</strong>
+            <p>先到 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」添加并授权文件夹，再把该文件夹的原始路径粘贴到上方。应用不再使用自身目录作为输入输出。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>环境信息</h2></div>
+          <div class="kv" id="toolInfo"></div>
+          <h3 class="sub-title">使用提示</h3>
+          <ul class="tips">
+            <li>所有处理都在本机完成，视频不会上传到任何服务器。</li>
+            <li>输入目录会递归读取子文件夹，文件列表显示相对路径。</li>
+            <li>输出文件名支持子目录，例如 <code>out/result.mp4</code>。</li>
+            <li>下载使用 ffmpeg 原生能力，支持直链、HLS、DASH 与页面公开地址。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+  </main>
 </div>
 
-<div class="card">
-  <h2>视频下载</h2>
-  <div class="row">
-    <label>视频地址（m3u8 / 网页链接）：</label>
-    <input type="text" id="url" placeholder="https://... 或 m3u8 地址">
+<nav class="mnav" aria-label="移动端导航">
+  <button class="mnav-item active" data-view="merge">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/></svg>
+    <span>合并</span>
+  </button>
+  <button class="mnav-item" data-view="process">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11a4 4 0 1 1 0 8H8"/><polyline points="7 4 4 7 7 10"/><path d="M20 17H9a4 4 0 1 1 0-8h7"/><polyline points="17 14 20 17 17 20"/></svg>
+    <span>转换</span>
+  </button>
+  <button class="mnav-item" data-view="clip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+    <span>剪辑</span>
+  </button>
+  <button class="mnav-item" data-view="download">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    <span>下载</span>
+  </button>
+  <button class="mnav-item" data-more="1">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>
+    <span>更多</span>
+  </button>
+</nav>
+
+<div class="sheet-backdrop" id="moreSheet" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="更多功能">
+    <div class="sheet-head">
+      <h2>更多功能</h2>
+      <button class="icon-btn" id="moreClose" title="关闭">×</button>
+    </div>
+    <div class="sheet-grid">
+      <button class="sheet-item" data-view="audio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        <span>提取音频</span>
+      </button>
+      <button class="sheet-item" data-view="subtitle">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 12h6M6 16h10M14 12h4"/></svg>
+        <span>字幕烧录</span>
+      </button>
+      <button class="sheet-item" data-view="advanced">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span>自定义命令</span>
+      </button>
+      <button class="sheet-item" data-view="tasks">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>
+        <span>任务</span>
+      </button>
+      <button class="sheet-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.73.85.3.2.66.3 1.02.3H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>目录与设置</span>
+      </button>
+    </div>
   </div>
-  <div class="row">
-    <label>保存到子目录（留空则存到媒体根目录）：</label>
-    <input type="text" id="subdir" placeholder="例如 downloads">
-  </div>
-  <button id="btnDownload" onclick="doDownload()">开始下载</button>
-  <div class="hint">yt-dlp 会自动识别 m3u8 分片，并调用 ffmpeg 合并为单个视频文件。</div>
 </div>
 
-<div class="card">
-  <h2>运行日志 <span id="status" class="status"></span></h2>
-  <div id="log">等待任务…</div>
+<div class="toasts" id="toasts"></div>
+
+<!-- 目录选择 -->
+<div class="modal-backdrop" id="pickerModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="pickerTitle">选择目录</h2>
+      <button class="icon-btn" id="pickerClose" title="关闭">×</button>
+    </div>
+    <div class="picker-goto">
+      <input id="pickerPathInput" type="text" placeholder="粘贴完整路径，如 /vol1/1000/视频" spellcheck="false">
+      <button class="btn ghost small" id="pickerGo">前往</button>
+    </div>
+    <p class="picker-hint">看不到目标文件夹时，直接从「文件管理」复制原始路径粘贴到这里。</p>
+    <div class="picker-path">
+      <button class="icon-btn" id="pickerUp" title="上一级">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <span id="pickerPath">-</span>
+    </div>
+    <div class="picker-list" id="pickerList"></div>
+    <div class="picker-new">
+      <input id="pickerNewName" type="text" placeholder="新建文件夹名称">
+      <button class="btn ghost small" id="pickerMkdir">新建</button>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="pickerCancel">取消</button>
+      <button class="btn primary" id="pickerChoose">选择此目录</button>
+    </div>
+  </div>
 </div>
 
-<script>
-let timer = null;
+<!-- 任务日志 -->
+<div class="modal-backdrop" id="logModal" hidden>
+  <div class="modal log-modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="logTitle">任务日志</h2>
+        <p class="log-sub" id="logSub">-</p>
+      </div>
+      <div class="head-tools">
+        <button class="btn danger small" id="logCancel" hidden>取消任务</button>
+        <button class="icon-btn" id="logClose" title="关闭">×</button>
+      </div>
+    </div>
+    <div class="progress big"><div class="progress-bar" id="logProgress"></div></div>
+    <pre class="log-body" id="logBody">等待日志…</pre>
+  </div>
+</div>
 
-function statusText(s) {
-  return { running: "运行中", done: "已完成", failed: "失败" }[s] || s;
-}
-
-function setRunning(running) {
-  document.getElementById("btnMerge").disabled = running;
-  document.getElementById("btnDownload").disabled = running;
-}
-
-function refreshFiles() {
-  fetch("/api/files").then(r => r.json()).then(list => {
-    const sel = document.getElementById("files");
-    const prev = new Set([...sel.options].filter(o => o.selected).map(o => o.value));
-    sel.innerHTML = "";
-    list.forEach(f => {
-      const o = document.createElement("option");
-      o.value = f.path;
-      o.textContent = f.path + "   (" + (f.size / 1048576).toFixed(1) + " MB)";
-      if (prev.has(f.path)) o.selected = true;
-      sel.appendChild(o);
-    });
-    document.getElementById("fileCount").textContent = "共 " + list.length + " 个视频文件";
-  });
-}
-
-function poll(tid) {
-  const box = document.getElementById("log");
-  const st = document.getElementById("status");
-  setRunning(true);
-  st.className = "status running";
-  st.textContent = "运行中";
-
-  timer = setInterval(() => {
-    fetch("/api/log/" + tid).then(r => r.json()).then(d => {
-      box.textContent = d.log.join("\n");
-      box.scrollTop = box.scrollHeight;
-      st.className = "status " + d.status;
-      st.textContent = statusText(d.status);
-      if (d.status !== "running") {
-        clearInterval(timer);
-        timer = null;
-        setRunning(false);
-        refreshFiles();
-      }
-    }).catch(() => {});
-  }, 1000);
-}
-
-function doMerge() {
-  const sel = document.getElementById("files");
-  const files = [...sel.selectedOptions].map(o => o.value);
-  if (files.length < 2) { alert("请至少选择 2 个文件"); return; }
-  fetch("/api/merge", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      files: files,
-      output: document.getElementById("outname").value.trim(),
-      reencode: document.getElementById("reen").checked
-    })
-  }).then(r => r.json()).then(d => {
-    if (d.error) { alert(d.error); return; }
-    poll(d.task);
-  });
-}
-
-function doDownload() {
-  const url = document.getElementById("url").value.trim();
-  if (!url) { alert("请输入视频地址"); return; }
-  fetch("/api/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url: url,
-      subdir: document.getElementById("subdir").value.trim()
-    })
-  }).then(r => r.json()).then(d => {
-    if (d.error) { alert(d.error); return; }
-    poll(d.task);
-  });
-}
-
-refreshFiles();
-</script>
+<script src="app.js?v=1.3.0"></script>
 </body>
 </html>

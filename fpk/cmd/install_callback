@@ -50,11 +50,7 @@ else
     log "WARN: ffmpeg not found in PATH"
 fi
 
-if [ -f "${TRIM_APPDEST}/bin/yt-dlp" ]; then
-    log "yt-dlp: bundled at ${TRIM_APPDEST}/bin/yt-dlp"
-else
-    log "WARN: bundled yt-dlp missing"
-fi
+log "downloader: ffmpeg native (no yt-dlp)"
 
 log "=== install_callback done ==="
 exit 0

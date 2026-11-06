@@ -4,10 +4,8 @@ PID_FILE="${TRIM_PKGVAR}/app.pid"
 
 SERVER_DIR="${TRIM_APPDEST}/server"
 ENTRY="${SERVER_DIR}/app.py"
-DATA="${TRIM_PKGVAR}/data"
-MEDIA="${TRIM_PKGVAR}/media"
 
-mkdir -p "${TRIM_PKGVAR}" "${DATA}" "${MEDIA}" 2>/dev/null
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
 
 log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
 check_process() { kill -0 "$1" 2>/dev/null; }
@@ -43,7 +41,7 @@ start_process() {
     fi
 
     cd "${SERVER_DIR}" || { log_msg "ERROR: cd failed"; return 1; }
-    DATA_DIR="${DATA}" MEDIA_DIR="${MEDIA}" PORT=18080 \
+    PORT=18080 \
         "${PYBIN}" "${ENTRY}" --host 0.0.0.0 --port 18080 >> "${LOG_FILE}" 2>&1 &
     local p=$!
     printf "%s" "$p" > "${PID_FILE}"

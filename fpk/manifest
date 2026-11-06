@@ -1,7 +1,8 @@
 appname               = video-tool
-version               = 1.0.2
+version               = 1.3.0
 display_name          = 视频助手
-desc                  = 视频处理工具箱，支持格式转换、合并拼接、字幕烧录等常用操作，基于 ffmpeg 实现，本地处理不上传
+desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
+changelog             = 移除 yt-dlp，下载改为 ffmpeg 原生；递归遍历输入子目录；清理无用根目录显示；重做下载页与移动端底部导航；补充 PWA 图标与 manifest
 platform              = x86
 source                = thirdparty
 maintainer            = 千里
