@@ -1,0 +1,9 @@
+appname=videotool
+display_name=视频助手
+version=1.0.0
+platform=x86_64
+desc=一款轻量的本地视频处理工具，支持在线浏览与管理，浏览器即开即用。
+maintainer=qianliaa
+distributor=联想天禧AI
+desktop_uidir=ui
+desktop_applaunchname=videotool
