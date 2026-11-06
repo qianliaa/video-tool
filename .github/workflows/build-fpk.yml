@@ -13,36 +13,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-- name: Download fnpack
-  run: |
-    set -e
-    # 尝试多个候选地址，第一个成功就用
-    URLS=(
-      "https://static2.fnnas.com/fnpack/fnpack-linux-amd64.tar.gz"
-      "https://static2.fnnas.com/fnpack/fnpack-1.2.0-linux-amd64.tar.gz"
-      "https://developer.fnnas.com/downloads/fnpack-linux-amd64.tar.gz"
-    )
-    OK=0
-    for u in "${URLS[@]}"; do
-      echo "尝试: $u"
-      if curl -fsSL --retry 2 --connect-timeout 10 -o fnpack.tar.gz "$u"; then
-        echo "✅ 下载成功: $u"
-        OK=1
-        break
-      else
-        echo "❌ 失败: $u"
-      fi
-    done
-    if [ "$OK" -eq 0 ]; then
-      echo "所有地址都失败，请到 https://developer.fnnas.com/docs/cli/fnpack 确认最新地址"
-      exit 1
-    fi
-    tar -xzf fnpack.tar.gz
-    chmod +x fnpack
-    ./fnpack --version || true
+      - name: Download fnpack
+        run: |
+          set -e
+          URLS=(
+            "https://static2.fnnas.com/fnpack/fnpack-linux-amd64.tar.gz"
+            "https://static2.fnnas.com/fnpack/fnpack-1.2.0-linux-amd64.tar.gz"
+            "https://static2.fnnas.com/fnpack/fnpack-1.0.3-linux-amd64.tar.gz"
+          )
+          OK=0
+          for u in "${URLS[@]}"; do
+            echo "try: $u"
+            if curl -fsSL --retry 2 --connect-timeout 10 -o fnpack.tar.gz "$u"; then
+              echo "download ok: $u"
+              OK=1
+              break
+            else
+              echo "download fail: $u"
+            fi
+          done
+          if [ "$OK" -eq 0 ]; then
+            echo "all urls failed, check https://developer.fnnas.com/docs/cli/fnpack"
+            exit 1
+          fi
           tar -xzf fnpack.tar.gz
           chmod +x fnpack
-          ./fnpack --version
+          ./fnpack --version || true
 
       - name: Build fpk
         run: |
