@@ -1,0 +1,13 @@
+{
+  "name": "videotool",
+  "version": "1.0.0",
+  "title": "VideoTool",
+  "description": "FFmpeg merge and yt-dlp download tool",
+  "author": "qianliaa",
+  "arch": ["x86_64"],
+  "os_min_version": "0.8.0",
+  "service": {
+    "port": 8090,
+    "protocol": "http"
+  }
+}

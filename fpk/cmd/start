@@ -1,0 +1,23 @@
+#!/bin/bash
+set -e
+
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SERVER_DIR="$APP_DIR/app/server"
+VENV="$SERVER_DIR/venv"
+LOG="/var/log/videotool.log"
+PIDFILE="$APP_DIR/.pid"
+
+export DATA_DIR="${DATA_DIR:-/vol1/1000/appdata/videotool}"
+export MEDIA_DIR="${MEDIA_DIR:-/vol1/1000/media}"
+mkdir -p "$DATA_DIR"
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "already running pid=$(cat "$PIDFILE")"
+    exit 0
+fi
+
+cd "$SERVER_DIR"
+nohup "$VENV/bin/python" app.py >> "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
+sleep 1
+echo "started pid=$(cat "$PIDFILE")"
