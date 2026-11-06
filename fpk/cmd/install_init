@@ -1,36 +1,10 @@
 #!/bin/bash
-set -e
+# install_init 在 app.tgz 解压之前执行，此时 target 目录还是空的
+# 任何依赖检查与安装都必须放到 install_callback 里做
 
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER_DIR="$APP_DIR/app/server"
-VENV="$SERVER_DIR/venv"
+LOG="${TRIM_PKGVAR}/install.log"
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || LOG="/tmp/video-tool-install.log"
 
-if command -v python3 >/dev/null 2>&1; then
-    PY=python3
-elif command -v python >/dev/null 2>&1; then
-    PY=python
-else
-    echo "ERROR: python not found"
-    exit 1
-fi
+echo "$(date '+%Y-%m-%d %H:%M:%S') - install_init: skip, app.tgz not extracted yet (TRIM_APPDEST=${TRIM_APPDEST})" >> "${LOG}" 2>&1
 
-echo "using $PY: $($PY --version 2>&1)"
-
-if [ ! -x "$VENV/bin/python" ]; then
-    echo "creating venv"
-    "$PY" -m venv "$VENV" || { echo "venv create failed"; exit 1; }
-fi
-
-echo "installing requirements"
-"$VENV/bin/pip" install --upgrade pip -q
-"$VENV/bin/pip" install -q -r "$SERVER_DIR/requirements.txt"
-
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "WARNING: ffmpeg not found on host"
-fi
-if ! command -v yt-dlp >/dev/null 2>&1; then
-    echo "WARNING: yt-dlp not found on host"
-fi
-
-echo "install_init done"
 exit 0

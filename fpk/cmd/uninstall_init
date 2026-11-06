@@ -1,8 +1,2 @@
 #!/bin/bash
-APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-if [ -f "$APP_DIR/.pid" ]; then
-    kill "$(cat "$APP_DIR/.pid")" 2>/dev/null || true
-    rm -f "$APP_DIR/.pid"
-fi
-rm -rf "$APP_DIR/app/server/venv"
 exit 0

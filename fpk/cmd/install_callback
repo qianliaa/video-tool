@@ -1,0 +1,60 @@
+#!/bin/bash
+# install_callback 在 app.tgz 解压之后执行，此时 ${TRIM_APPDEST}/server 才存在
+# 本应用后端只用 Python 标准库，不需要 pip / venv / 联网安装依赖
+
+LOG="${TRIM_PKGVAR}/install.log"
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || LOG="/tmp/video-tool-install.log"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG}" 2>&1; }
+
+log "=== install_callback start ==="
+log "TRIM_APPDEST=${TRIM_APPDEST}"
+log "TRIM_PKGVAR=${TRIM_PKGVAR}"
+
+SERVER_DIR="${TRIM_APPDEST}/server"
+
+if [ ! -d "${SERVER_DIR}" ]; then
+    log "ERROR: server dir not found: ${SERVER_DIR}"
+    ls -la "${TRIM_APPDEST}" >> "${LOG}" 2>&1
+    exit 0
+fi
+log "SERVER_DIR=${SERVER_DIR} OK"
+
+# 优先使用飞牛 Python 运行时（manifest 里通过 install_dep_apps 声明）
+PY=""
+for c in /var/apps/python311/target/bin/python3 \
+         /var/apps/python312/target/bin/python3 \
+         /var/apps/python310/target/bin/python3 \
+         /var/apps/python39/target/bin/python3; do
+    if [ -x "$c" ]; then PY="$c"; break; fi
+done
+if [ -z "$PY" ]; then
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+    done
+fi
+if [ -z "$PY" ]; then
+    log "ERROR: python3/python not found"
+else
+    log "python: ${PY} $($PY --version 2>&1)"
+    if "$PY" -m py_compile "${SERVER_DIR}/app.py" >> "${LOG}" 2>&1; then
+        log "app.py syntax OK"
+    else
+        log "ERROR: app.py syntax check failed"
+    fi
+fi
+
+if command -v ffmpeg >/dev/null 2>&1; then
+    log "ffmpeg: $(command -v ffmpeg) $(ffmpeg -version 2>/dev/null | head -n 1)"
+else
+    log "WARN: ffmpeg not found in PATH"
+fi
+
+if [ -f "${TRIM_APPDEST}/bin/yt-dlp" ]; then
+    log "yt-dlp: bundled at ${TRIM_APPDEST}/bin/yt-dlp"
+else
+    log "WARN: bundled yt-dlp missing"
+fi
+
+log "=== install_callback done ==="
+exit 0

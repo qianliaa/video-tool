@@ -1,13 +1,11 @@
-{
-  "name": "videotool",
-  "version": "1.0.0",
-  "title": "VideoTool",
-  "description": "FFmpeg merge and yt-dlp download tool",
-  "author": "qianliaa",
-  "arch": ["x86_64"],
-  "os_min_version": "0.8.0",
-  "service": {
-    "port": 8090,
-    "protocol": "http"
-  }
-}
+appname               = video-tool
+version               = 1.0.2
+display_name          = 视频助手
+desc                  = 视频处理工具箱，支持格式转换、合并拼接、字幕烧录等常用操作，基于 ffmpeg 实现，本地处理不上传
+platform              = x86
+source                = thirdparty
+maintainer            = 千里
+distributor           = 千里
+desktop_uidir         = ui
+desktop_applaunchname = video-tool.Application
+install_dep_apps      = python311

@@ -1,6 +1,17 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.fpk
 *.log
+*.fixbak
 .vscode/
 .idea/
+
+# build / package artifacts
+app.tgz
+check.tar.gz
+check_extract/
+_backup/
+_smoke/
+fnpack.exe
+template-demo/
+icon-src.jpg
