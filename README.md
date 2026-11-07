@@ -40,32 +40,15 @@
 - 任务进度、实时日志、运行中取消
 - 所有处理均在本机完成，不上传任何文件
 
-## 访问控制
+## 访问方式
 
-首次打开 Web 界面时，页面会要求设置访问密码（至少 8 个字符），之后每次访问需要登录。密码使用 `scrypt` 派生后保存在 `${TRIM_PKGVAR}/auth.json`，不会保存明文；会话 Cookie 带 `HttpOnly` 与 `SameSite=Strict`，有效期 7 天，应用重启后需要重新登录。
+应用不内置密码或登录，启动后打开 Web 界面即可直接使用，所有接口无需认证。
 
-- 除登录 / 状态查询外，所有 `/api` 接口都需要登录，包括处理任务、自定义 ffmpeg、下载和目录浏览。
-- 写操作会校验 `Origin`，并只接受 `application/json`，配合 SameSite Cookie 防止 CSRF。
-- 只接受 IP、`localhost`、`.local`、本机主机名或 `VT_ALLOWED_HOSTS` 中配置的域名作为 Host，其他 Host 返回 403，以降低 DNS rebinding 风险。
-- 通过反向代理或自定义域名访问时，启动前设置 `VT_ALLOWED_HOSTS=video.example.com`，多个域名用逗号分隔。
+- 从 1.3.7 起移除了访问密码、会话 Cookie、Host 白名单与 Origin / Content-Type 校验，反向代理或自定义域名访问不会再被误判为 403。
+- 升级前遗留的 `${TRIM_PKGVAR}/auth.json` 不会再被读取或校验，也不会导致启动报错，可保留或自行删除。
+- `VT_ALLOWED_HOSTS`、`VT_RESET_AUTH` 已不再使用。
+- 如果应用暴露在公网，请依赖 fnOS 的反向代理 / 网关做访问控制，或在网络层限制来源 IP。
 - 实际配置目录可在应用「设置 → 配置目录」中查看，fnOS 上通常为 `/vol1/@appdata/video-tool`。
-
-### 忘记密码 / 重置访问控制
-
-任选一种方式：
-
-1. 停止应用，删除 `${TRIM_PKGVAR}/auth.json`，再启动应用。打开页面后会重新进入“设置访问密码”流程。
-2. 在启动环境中设置 `VT_RESET_AUTH=1` 后启动一次，服务会删除密码文件；随后移除该变量并重启应用，避免每次启动都重置。
-
-在 fnOS 上可 SSH 登录后执行：
-
-```bash
-# 先停止应用（应用中心或 fnOS 桌面操作均可）
-rm -f /vol1/@appdata/video-tool/auth.json
-# 或在启动应用前设置 VT_RESET_AUTH=1（应用安装路径以实际环境为准）
-```
-
-如果实际目录不同，请以「设置 → 配置目录」显示的路径为准。
 
 ## 目录设置
 
@@ -89,7 +72,7 @@ rm -f /vol1/@appdata/video-tool/auth.json
 python pack.py
 ```
 
-输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.6.fpk`），在飞牛应用中心手动安装即可。
+输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.7.fpk`），在飞牛应用中心手动安装即可。
 
 打包脚本会：
 

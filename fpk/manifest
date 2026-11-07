@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.3.6
+version               = 1.3.7
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 取消设置页的「FFmpeg 来源」选择，统一使用系统原生 ffmpeg；保留 PATH 与常见系统路径解析，找不到时给出明确错误；检查更新、发布者/开发者与项目链接等功能保持不变
+changelog             = 移除访问密码与登录：删除首次设置密码、登录、退出界面及会话过期拦截，后端删除认证接口、会话校验、Cookie 与密码派生；同时去掉 Host 白名单与 Origin/Content-Type 校验，修复反向代理场景误报 403；遗留 auth.json 不再读取，所有接口恢复无需认证直接访问；检查更新、发布者信息、任务与下载保持不变
 platform              = x86
 source                = thirdparty
 maintainer            = 千里

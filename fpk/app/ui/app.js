@@ -26,8 +26,7 @@
     logId: null,
     logTimer: null,
     taskTimer: null,
-    updateBusy: false,
-    auth: { configured: false, authenticated: false, setup: false, busy: false }
+    updateBusy: false
   };
 
   var VIEW_META = {
@@ -136,12 +135,6 @@
   function api(path, options) {
     return fetch(path, options).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
-        if (res.status === 401) {
-          var deny = new Error((data && data.error) || "未登录或登录已过期");
-          deny.unauthorized = true;
-          handleUnauthorized();
-          throw deny;
-        }
         if (!res.ok) throw new Error((data && data.error) || ("请求失败（" + res.status + "）"));
         return data;
       });
@@ -156,48 +149,6 @@
     });
   }
 
-  // 登录/设置密码走独立请求，避免 401 再次触发登录遮罩
-  function authFetch(path, body) {
-    return fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body || {})
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.error) || ("请求失败（" + res.status + "）"));
-        return data;
-      });
-    });
-  }
-
-  function setAuthError(message) {
-    var box = $("#authError");
-    if (!box) return;
-    box.textContent = message || "";
-    box.hidden = !message;
-  }
-
-  function showAuth(configured) {
-    state.auth.configured = !!configured;
-    state.auth.setup = !configured;
-    state.auth.authenticated = false;
-    var modal = $("#authModal");
-    if (!modal) return;
-    modal.hidden = false;
-    $("#authTitle").textContent = configured ? "访问验证" : "设置访问密码";
-    $("#authDesc").textContent = configured
-      ? "请输入访问密码后继续"
-      : "首次使用，请设置一个访问密码（至少 8 个字符）";
-    $("#authSubmit").textContent = configured ? "登录" : "设置并进入";
-    $("#authPassword").autocomplete = configured ? "current-password" : "new-password";
-    $("#authPassword").value = "";
-    $("#authHint").hidden = !configured;
-    setAuthError("");
-    setTimeout(function () {
-      if (!modal.hidden) $("#authPassword").focus();
-    }, 60);
-  }
-
   function stopPolling() {
     clearInterval(state.taskTimer);
     state.taskTimer = null;
@@ -205,70 +156,7 @@
     state.logTimer = null;
   }
 
-  function handleUnauthorized() {
-    stopPolling();
-    if (!$("#authModal").hidden) return;
-    if (state.logId) {
-      state.logId = null;
-      $("#logModal").hidden = true;
-    }
-    showAuth(state.auth.configured);
-  }
-
-  function checkAuth() {
-    return fetch("/api/auth/status", { cache: "no-store" })
-      .then(function (res) {
-        return res.json().catch(function () { return {}; }).then(function (data) {
-          if (!res.ok) throw new Error((data && data.error) || ("访问校验失败（" + res.status + "）"));
-          return data;
-        });
-      })
-      .then(function (data) {
-        state.auth.configured = !!data.configured;
-        state.auth.authenticated = !!data.authenticated;
-        if (state.auth.authenticated) startApp();
-        else showAuth(state.auth.configured);
-      })
-      .catch(function (err) {
-        showAuth(state.auth.configured);
-        setAuthError("无法连接服务：" + err.message);
-      });
-  }
-
-  function submitAuth(event) {
-    event.preventDefault();
-    if (state.auth.busy) return;
-    var password = $("#authPassword").value;
-    if (password.length < 8) {
-      setAuthError("密码至少需要 8 个字符");
-      $("#authPassword").focus();
-      return;
-    }
-    state.auth.busy = true;
-    $("#authSubmit").disabled = true;
-    setAuthError("");
-    var wasSetup = state.auth.setup;
-    var path = wasSetup ? "/api/auth/setup" : "/api/auth/login";
-    authFetch(path, { password: password }).then(function () {
-      state.auth.configured = true;
-      state.auth.authenticated = true;
-      state.auth.setup = false;
-      state.auth.busy = false;
-      $("#authSubmit").disabled = false;
-      $("#authModal").hidden = true;
-      toast(wasSetup ? "访问密码已设置" : "已登录", "success", 1800);
-      startApp();
-    }).catch(function (err) {
-      state.auth.busy = false;
-      $("#authSubmit").disabled = false;
-      setAuthError(err.message);
-      $("#authPassword").select();
-    });
-  }
-
   function startApp() {
-    state.auth.authenticated = true;
-    $("#authModal").hidden = true;
     loadTools()
       .then(loadConfig)
       .then(loadFiles)
@@ -281,7 +169,7 @@
         updatePreviews();
       })
       .catch(function (err) {
-        if (!err || !err.unauthorized) toast("初始化失败：" + err.message, "error", 8000);
+        toast("初始化失败：" + err.message, "error", 8000);
       });
     loadTasks(true);
     stopPolling();
@@ -418,7 +306,7 @@
       renderAbout();
       return info;
     }).catch(function (err) {
-      if (!err || !err.unauthorized) toast("读取环境信息失败：" + err.message, "error");
+      toast("读取环境信息失败：" + err.message, "error");
     });
   }
 
@@ -447,14 +335,12 @@
       ["ffmpeg", m ? "v" + m[1] : (ffmpegVer || "未就绪"), ffmpegVer],
       ["ffmpeg 目录", t.ffmpeg_dir || "-"],
       ["下载引擎", t.downloader === "ffmpeg" ? "ffmpeg 原生" : "未就绪"],
-      ["访问控制", t.auth_enabled ? "已启用" : "未设置", t.auth_file || ""],
       ["配置目录", t.pkgvar || "-"]
     ];
     if (!t.ffmpeg && t.ffmpeg_error) rows.splice(1, 0, ["ffmpeg 错误", t.ffmpeg_error]);
     box.innerHTML = rows.map(function (r) {
       return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[2] || r[1]) + '">' + esc(r[1]) + '</span></div>';
     }).join("");
-    if ($("#authFilePath")) $("#authFilePath").textContent = t.auth_file || "auth.json";
   }
 
   function renderAbout() {
@@ -518,7 +404,6 @@
     api("/api/update?refresh=1").then(function (result) {
       renderUpdate(result);
     }).catch(function (err) {
-      if (err && err.unauthorized) return;
       var tip = $("#updateStatus");
       if (tip) {
         tip.className = "update-status bad";
@@ -836,7 +721,6 @@
       renderTasks();
       updateTaskBadge();
     }).catch(function (err) {
-      if (err && err.unauthorized) return;
       if (!silent) toast("读取任务失败：" + err.message, "error");
     });
   }
@@ -848,7 +732,7 @@
       openLog(data.task);
       return data;
     }).catch(function (err) {
-      if (!err || !err.unauthorized) toast(err.message, "error", 6000);
+      toast(err.message, "error", 6000);
     });
   }
 
@@ -858,7 +742,7 @@
       loadTasks(true);
       if (fromLog) pollLog();
     }).catch(function (err) {
-      if (!err || !err.unauthorized) toast(err.message, "error");
+      toast(err.message, "error");
     });
   }
 
@@ -912,7 +796,6 @@
         loadTasks(true);
       }
     }).catch(function (err) {
-      if (err && err.unauthorized) return;
       $("#logBody").textContent = "读取日志失败：" + err.message;
       clearInterval(state.logTimer);
       state.logTimer = null;
@@ -1339,18 +1222,6 @@
     });
   }
 
-  function bindAuth() {
-    $("#authForm").addEventListener("submit", submitAuth);
-    $("#authLogout").addEventListener("click", function () {
-      authFetch("/api/auth/logout", {}).catch(function () {}).then(function () {
-        state.auth.authenticated = false;
-        stopPolling();
-        showAuth(true);
-        toast("已退出登录");
-      });
-    });
-  }
-
   function bindGlobal() {
     $("#themeBtn").addEventListener("click", function () {
       applyTheme(currentTheme() === "dark" ? "light" : "dark");
@@ -1367,18 +1238,17 @@
       backdrop.addEventListener("mousedown", function (e) {
         if (e.target !== backdrop) return;
         if (backdrop.id === "logModal") closeLog();
-        else if (backdrop.id !== "authModal") backdrop.hidden = true;
+        else backdrop.hidden = true;
       });
     });
     document.addEventListener("keydown", function (e) {
       if (e.key !== "Escape") return;
-      if (!$("#authModal").hidden) return;
       if (!$("#logModal").hidden) closeLog();
       else if (!$("#pickerModal").hidden) $("#pickerModal").hidden = true;
       else if (!$("#moreSheet").hidden) $("#moreSheet").hidden = true;
     });
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden && state.auth.authenticated) loadTasks(true);
+      if (!document.hidden) loadTasks(true);
     });
   }
 
@@ -1403,14 +1273,13 @@
     bindAbout();
     bindPicker();
     bindLog();
-    bindAuth();
     bindGlobal();
 
     var initial = (window.location.hash || "").replace(/^#/, "");
     setView(VIEW_META[initial] ? initial : "merge");
 
     updateConvertCopyState();
-    checkAuth();
+    startApp();
   }
 
   if (document.readyState === "loading") {

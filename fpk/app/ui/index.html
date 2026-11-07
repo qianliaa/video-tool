@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.3.6">
+<link rel="stylesheet" href="style.css?v=1.3.7">
 </head>
 <body>
 <div class="app">
@@ -551,11 +551,6 @@
         <div class="card">
           <div class="card-head"><h2>环境信息</h2></div>
           <div class="kv" id="toolInfo"></div>
-          <div class="notice auth-notice">
-            <strong>访问控制</strong>
-            <p>已启用访问密码。忘记密码时：停止应用，删除配置目录中的 <code id="authFilePath">auth.json</code>，重新启动后回到本页设置新密码；或在启动前设置环境变量 <code>VT_RESET_AUTH=1</code>。</p>
-          </div>
-          <button class="btn ghost block" id="authLogout">退出登录</button>
           <h3 class="sub-title">使用提示</h3>
           <ul class="tips">
             <li>所有处理都在本机完成，视频不会上传到任何服务器。</li>
@@ -641,27 +636,6 @@
 
 <div class="toasts" id="toasts"></div>
 
-<!-- 访问验证 -->
-<div class="modal-backdrop" id="authModal" hidden>
-  <div class="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
-    <div class="modal-head">
-      <div>
-        <h2 id="authTitle">访问验证</h2>
-        <p class="log-sub" id="authDesc">请输入访问密码后继续</p>
-      </div>
-    </div>
-    <form id="authForm">
-      <div class="field">
-        <label for="authPassword">访问密码</label>
-        <input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128" placeholder="至少 8 个字符" required>
-      </div>
-      <p class="auth-error" id="authError" hidden></p>
-      <button class="btn primary block" id="authSubmit" type="submit">登录</button>
-    </form>
-    <p class="auth-hint" id="authHint">忘记密码？停止应用后删除配置目录中的 auth.json，或启动前设置环境变量 VT_RESET_AUTH=1，重新启动后即可重新设置。</p>
-  </div>
-</div>
-
 <!-- 目录选择 -->
 <div class="modal-backdrop" id="pickerModal" hidden>
   <div class="modal">
@@ -710,6 +684,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.3.6"></script>
+<script src="app.js?v=1.3.7"></script>
 </body>
 </html>
