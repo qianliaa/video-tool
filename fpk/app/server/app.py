@@ -9,13 +9,18 @@
 """
 import argparse
 import codecs
+import hashlib
+import hmac
 import html as html_lib
+import ipaddress
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -33,7 +38,18 @@ BIN_DIR = os.path.join(APP_DIR, "bin")
 
 PKGVAR = os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.expanduser("~"), ".video-tool")
 CONFIG_PATH = os.path.join(PKGVAR, "config.json")
+AUTH_PATH = os.path.join(PKGVAR, "auth.json")
 LIST_DIR = os.path.join(PKGVAR, "lists")
+
+SESSION_COOKIE = "vt_session"
+SESSION_TTL = 7 * 24 * 3600
+LOGIN_WINDOW = 300
+LOGIN_MAX_FAILS = 8
+AUTH_DATA = None
+SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
+LOGIN_FAILS = {}
+LOGIN_FAILS_LOCK = threading.Lock()
 
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv", ".webm", ".m4v",
               ".wmv", ".mpg", ".mpeg", ".3gp", ".m2ts", ".vob", ".ogv", ".rmvb")
@@ -45,7 +61,7 @@ URL_MEDIA_EXTS = (".m3u8", ".mpd", ".mp4", ".mkv", ".mov", ".m4v", ".webm",
                   ".wav", ".ogg", ".opus")
 DOWNLOAD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
-               "Chrome/126.0 Safari/537.36 VideoTool/1.3.2")
+               "Chrome/126.0 Safari/537.36 VideoTool/1.3.3")
 MAX_PAGE_BYTES = 2 * 1024 * 1024
 MAX_SCAN_FILES = 5000
 MAX_SCAN_DEPTH = 8
@@ -260,6 +276,242 @@ def save_config():
             json.dump(data, fp, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# 访问控制
+# --------------------------------------------------------------------------
+
+def auth_configured():
+    return isinstance(AUTH_DATA, dict) and bool(AUTH_DATA.get("hash"))
+
+
+def load_auth():
+    """读取密码文件；VT_RESET_AUTH=1 时删除密码文件，用于忘记密码时重置。"""
+    global AUTH_DATA
+    AUTH_DATA = None
+    if os.environ.get("VT_RESET_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            os.remove(AUTH_PATH)
+            sys.stderr.write("access control: auth file removed by VT_RESET_AUTH\n")
+        except OSError:
+            pass
+        return
+    try:
+        with open(AUTH_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("algo") != "scrypt" or not data.get("salt") or not data.get("hash"):
+        return
+    AUTH_DATA = data
+
+
+def _auth_write(data):
+    tmp = AUTH_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, AUTH_PATH)
+        try:
+            os.chmod(AUTH_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def set_password(password):
+    """密码只以 scrypt 派生值落盘，不保存明文。"""
+    global AUTH_DATA
+    salt = secrets.token_bytes(16)
+    n, r, p = 16384, 8, 1
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                            dklen=32, maxmem=64 * 1024 * 1024)
+    data = {
+        "version": 1,
+        "algo": "scrypt",
+        "n": n,
+        "r": r,
+        "p": p,
+        "salt": salt.hex(),
+        "hash": digest.hex(),
+        "created": int(time.time()),
+    }
+    _auth_write(data)
+    AUTH_DATA = data
+
+
+def verify_password(password):
+    data = AUTH_DATA
+    if not isinstance(data, dict):
+        return False
+    try:
+        salt = bytes.fromhex(data.get("salt") or "")
+        expected = data.get("hash") or ""
+        digest = hashlib.scrypt(password.encode("utf-8"),
+                                salt=salt,
+                                n=int(data.get("n") or 16384),
+                                r=int(data.get("r") or 8),
+                                p=int(data.get("p") or 1),
+                                dklen=len(bytes.fromhex(expected)),
+                                maxmem=64 * 1024 * 1024)
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError, OSError):
+        return False
+
+
+def issue_session():
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with SESSIONS_LOCK:
+        for key in [k for k, exp in SESSIONS.items() if exp <= now]:
+            SESSIONS.pop(key, None)
+        SESSIONS[token] = now + SESSION_TTL
+    return token
+
+
+def session_valid(token):
+    if not token:
+        return False
+    now = time.time()
+    with SESSIONS_LOCK:
+        exp = SESSIONS.get(token)
+        if not exp or exp <= now:
+            SESSIONS.pop(token, None)
+            return False
+        return True
+
+
+def drop_session(token):
+    if not token:
+        return
+    with SESSIONS_LOCK:
+        SESSIONS.pop(token, None)
+
+
+def cookie_value(raw, name):
+    for part in (raw or "").split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        if key == name:
+            return value.strip()
+    return ""
+
+
+def request_authenticated(handler):
+    if not auth_configured():
+        return False
+    token = cookie_value(handler.headers.get("Cookie", ""), SESSION_COOKIE)
+    return session_valid(token)
+
+
+def host_name(host_header):
+    text = (host_header or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("["):
+        end = text.find("]")
+        return text[1:end] if end > 0 else text
+    if ":" in text:
+        return text.rsplit(":", 1)[0]
+    return text
+
+
+def host_port(host_header):
+    text = (host_header or "").strip().lower()
+    if text.startswith("["):
+        end = text.find("]")
+        rest = text[end + 1:] if end > 0 else ""
+        if rest.startswith(":") and rest[1:].isdigit():
+            return int(rest[1:])
+        return None
+    if ":" in text:
+        port = text.rsplit(":", 1)[1]
+        if port.isdigit():
+            return int(port)
+    return None
+
+
+def host_allowed(host_header):
+    """拒绝非常规 Host，降低 DNS rebinding 风险；IP 访问始终允许。"""
+    host = host_name(host_header)
+    if not host:
+        return False
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        names = {socket.gethostname().lower(), socket.getfqdn().lower()}
+    except OSError:
+        names = set()
+    names.discard("")
+    if host in names:
+        return True
+    short = host.split(".", 1)[0]
+    if short and short in {name.split(".", 1)[0] for name in names}:
+        return True
+    if host.endswith(".local"):
+        return True
+    allowed = [x.strip().lower() for x in
+               (os.environ.get("VT_ALLOWED_HOSTS") or "").split(",") if x.strip()]
+    return any(host == item or host.endswith("." + item) for item in allowed)
+
+
+def same_origin(handler):
+    """校验 Origin / Sec-Fetch-Site，配合 SameSite=Strict Cookie 防 CSRF。"""
+    site = handler.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if site and site not in ("same-origin", "same-site", "none"):
+        return False
+    origin = (handler.headers.get("Origin") or "").strip()
+    if not origin:
+        return True
+    if origin.lower() == "null":
+        return False
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    origin_host = (parsed.hostname or "").lower()
+    if origin_host != host_name(handler.headers.get("Host", "")):
+        return False
+    origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    request_port = host_port(handler.headers.get("Host", ""))
+    return not request_port or origin_port == request_port
+
+
+def login_fail_count(ip):
+    now = time.time()
+    with LOGIN_FAILS_LOCK:
+        items = [t for t in LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
+        LOGIN_FAILS[ip] = items
+        return len(items)
+
+
+def note_login_fail(ip):
+    now = time.time()
+    with LOGIN_FAILS_LOCK:
+        LOGIN_FAILS.setdefault(ip, []).append(now)
+
+
+def clear_login_fail(ip):
+    with LOGIN_FAILS_LOCK:
+        LOGIN_FAILS.pop(ip, None)
 
 
 def human_size(n):
@@ -1096,17 +1348,25 @@ def build_download(p):
 # --------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoTool/1.3.2"
+    server_version = "VideoTool/1.3.3"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    def send_json(self, obj, code=200):
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "same-origin")
+
+    def send_json(self, obj, code=200, extra_headers=None):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self._security_headers()
+        for key, value in (extra_headers or []):
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1122,8 +1382,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", MIME.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def _session_cookie(self, token, max_age):
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        parts = ["%s=%s" % (SESSION_COOKIE, token), "Path=/", "HttpOnly",
+                 "SameSite=Strict", "Max-Age=%d" % max_age]
+        if proto == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _host_guard(self):
+        if host_allowed(self.headers.get("Host", "")):
+            return True
+        self.send_json({"error": "Host 不被允许，请通过 IP、本机域名或 VT_ALLOWED_HOSTS 中配置的域名访问",
+                        "code": "bad_host"}, 403)
+        return False
+
+    def _auth_guard(self, path):
+        if not path.startswith("/api/") or path.startswith("/api/auth/"):
+            return True
+        if request_authenticated(self):
+            return True
+        self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401,
+                       [("WWW-Authenticate", 'VT realm="video-tool"')])
+        return False
+
+    def _post_guard(self):
+        if not self._host_guard():
+            return False
+        if not same_origin(self):
+            self.send_json({"error": "跨站请求被拒绝", "code": "bad_origin"}, 403)
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self.send_json({"error": "请求必须使用 application/json", "code": "bad_content_type"}, 415)
+            return False
+        return True
 
     def read_json(self):
         try:
@@ -1147,8 +1444,14 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
 
         try:
+            if not self._host_guard():
+                return
+            if not self._auth_guard(path):
+                return
             if path in ("/", "/index.html"):
                 self.send_file(os.path.join(UI_DIR, "index.html"))
+            elif path == "/api/auth/status":
+                self.api_auth_status()
             elif path == "/api/config":
                 self.api_config()
             elif path == "/api/tools":
@@ -1158,6 +1461,8 @@ class Handler(BaseHTTPRequestHandler):
                     "output_dir": OUTPUT_DIR,
                     "roots": ROOTS,
                     "pkgvar": PKGVAR,
+                    "auth_enabled": auth_configured(),
+                    "auth_file": AUTH_PATH,
                 })
                 self.send_json(info)
             elif path == "/api/browse":
@@ -1178,6 +1483,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "not found"}, 404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
+
+    def api_auth_status(self):
+        self.send_json({
+            "configured": auth_configured(),
+            "authenticated": request_authenticated(self),
+            "setup_required": not auth_configured(),
+            "password_min": 8,
+        })
 
     def api_config(self):
         input_ok, input_error = dir_state(INPUT_DIR, False)
@@ -1387,7 +1700,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/config":
+            if not self._post_guard():
+                return
+            if not self._auth_guard(path):
+                return
+            if path == "/api/auth/setup":
+                self.api_auth_setup()
+            elif path == "/api/auth/login":
+                self.api_auth_login()
+            elif path == "/api/auth/logout":
+                self.api_auth_logout()
+            elif path == "/api/config":
                 self.api_save_config()
             elif path == "/api/checkdir":
                 self.api_checkdir()
@@ -1403,6 +1726,56 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 400)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
+
+    def api_auth_setup(self):
+        if auth_configured():
+            self.send_json({"error": "访问密码已设置，请直接登录", "code": "already_configured"}, 409)
+            return
+        data = self.read_json()
+        password = data.get("password")
+        if not isinstance(password, str):
+            password = ""
+        if len(password) < 8:
+            raise ValueError("密码至少需要 8 个字符")
+        if len(password) > 128:
+            raise ValueError("密码不能超过 128 个字符")
+        try:
+            set_password(password)
+        except OSError as exc:
+            raise ValueError("保存密码失败：%s" % exc)
+        token = issue_session()
+        self.send_json({"ok": True, "configured": True},
+                       extra_headers=[("Set-Cookie", self._session_cookie(token, SESSION_TTL))])
+
+    def api_auth_login(self):
+        if not auth_configured():
+            self.send_json({"error": "尚未设置访问密码", "code": "setup_required"}, 409)
+            return
+        ip = self.client_address[0]
+        if login_fail_count(ip) >= LOGIN_MAX_FAILS:
+            self.send_json({"error": "尝试次数过多，请稍后再试", "code": "too_many_attempts"},
+                           429, [("Retry-After", str(LOGIN_WINDOW))])
+            return
+        data = self.read_json()
+        password = data.get("password")
+        if not isinstance(password, str):
+            password = ""
+        if not verify_password(password):
+            note_login_fail(ip)
+            time.sleep(0.35)
+            self.send_json({"error": "密码不正确", "code": "bad_password"}, 401)
+            return
+        clear_login_fail(ip)
+        token = issue_session()
+        self.send_json({"ok": True, "configured": True},
+                       extra_headers=[("Set-Cookie", self._session_cookie(token, SESSION_TTL))])
+
+    def api_auth_logout(self):
+        drop_session(cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE))
+        self.send_json({"ok": True},
+                       extra_headers=[("Set-Cookie",
+                                       "%s=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+                                       % SESSION_COOKIE)])
 
     def api_save_config(self):
         global INPUT_DIR, OUTPUT_DIR
@@ -1566,6 +1939,7 @@ def main():
     args = parser.parse_args()
 
     load_config()
+    load_auth()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
 
@@ -1580,6 +1954,7 @@ def main():
     print("input:  %s" % INPUT_DIR)
     print("output: %s" % OUTPUT_DIR)
     print("roots:  %s" % ", ".join(ROOTS))
+    print("auth:   %s (%s)" % ("enabled" if auth_configured() else "setup required", AUTH_PATH))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
