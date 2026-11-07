@@ -887,7 +887,7 @@
 
   function runDownload() {
     if (!requireDirs(false, true)) return;
-    var url = ($("#dlUrl").value || "").trim();
+    var url = ($("#dlUrl").value || "").trim().replace(/^[`'"<>]+|[`'"<>]+$/g, "").trim();
     if (!url) { toast("请填写视频地址", "error"); return; }
     if (!/^https?:\/\//i.test(url)) { toast("请填写 http/https 地址", "error"); return; }
     var params = {

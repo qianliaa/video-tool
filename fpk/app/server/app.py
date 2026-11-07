@@ -109,6 +109,23 @@ def find_bin(name):
     return None
 
 
+FFMPEG_OPTIONS = {}
+
+
+def ffmpeg_support(ffmpeg, name):
+    """检测 ffmpeg 是否支持某个选项，不同版本能力不同，结果缓存。"""
+    key = (ffmpeg, name)
+    if key not in FFMPEG_OPTIONS:
+        try:
+            out = subprocess.run([ffmpeg, "-hide_banner", "-h", "full"],
+                                 capture_output=True, text=True, timeout=20)
+            text = (out.stdout or "") + (out.stderr or "")
+            FFMPEG_OPTIONS[key] = ("-" + name) in text
+        except (OSError, subprocess.SubprocessError):
+            FFMPEG_OPTIONS[key] = False
+    return FFMPEG_OPTIONS[key]
+
+
 def real(path):
     return os.path.realpath(os.path.abspath(path))
 
@@ -751,6 +768,11 @@ def build_ffmpeg(action, p):
 # ffmpeg 原生下载
 # --------------------------------------------------------------------------
 
+def clean_media_url(url):
+    """去掉粘贴地址时常见的包裹字符（反引号、引号、尖括号）与首尾空白。"""
+    return (url or "").strip().strip("`'\"<>").strip()
+
+
 def download_headers(p):
     headers = {"User-Agent": (p.get("user_agent") or "").strip() or DOWNLOAD_UA,
                "Accept": "*/*"}
@@ -957,7 +979,7 @@ def default_download_name(media_url, title, mode, audio_format):
 
 
 def build_download(p):
-    url = (p.get("url") or "").strip()
+    url = clean_media_url(p.get("url"))
     if not url:
         raise ValueError("请填写视频地址")
     if not re.match(r"^https?://", url, re.I):
@@ -1021,6 +1043,9 @@ def build_download(p):
     if extra:
         cmd += ["-headers", "".join("%s: %s\r\n" % (k, v) for k, v in extra.items())]
     cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    # ffmpeg 7.1+ 默认按 URL 扩展名校验分片，HLS 常见 .mp4 后缀的 mpegts 分片会被判为不匹配
+    if ffmpeg_support(ffmpeg, "extension_picky"):
+        cmd += ["-extension_picky", "0"]
     cmd += ["-i", media_url]
 
     if mode == "audio":
