@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.3.3
+version               = 1.3.4
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 新增访问控制：首次打开需设置访问密码，之后需登录；密码使用 scrypt 派生后保存，不落明文；全部 API（处理、自定义 ffmpeg、下载、目录浏览）均需认证，并校验 Host/Origin 防 DNS rebinding 与 CSRF；删除 auth.json 或设置 VT_RESET_AUTH=1 可重置密码
+changelog             = 打包产物改为按版本命名（video-tool-<版本>.fpk）；应用标识、包内结构与功能与 1.3.3 一致
 platform              = x86
 source                = thirdparty
 maintainer            = 千里
