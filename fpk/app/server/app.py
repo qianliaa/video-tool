@@ -8,7 +8,10 @@
   - 任务进度、日志、取消
 """
 import argparse
+import base64
 import codecs
+import hashlib
+import hmac
 import html as html_lib
 import json
 import os
@@ -24,14 +27,14 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.3.7"
+APP_VERSION = "1.3.8"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -339,6 +342,640 @@ def save_config():
 
 
 # --------------------------------------------------------------------------
+# 通知（IM 群机器人 Webhook）
+# --------------------------------------------------------------------------
+
+NOTIFY_PATH = os.path.join(PKGVAR, "notify.json")
+NOTIFY_TIMEOUT = 8
+NOTIFY_RETRIES = 1
+NOTIFY_BATCH_WAIT = 3.0
+NOTIFY_SEEN_TTL = 600
+NOTIFY_HISTORY_MAX = 100
+NOTIFY_MAX_CHANNELS = 12
+HEARTBEAT_FAIL_THRESHOLD = 3
+HEARTBEAT_INTERVAL_DEFAULT = 300
+
+NOTIFY_TYPES = [
+    ("wecom", "企业微信群机器人"),
+    ("feishu", "飞书群机器人"),
+    ("dingtalk", "钉钉群机器人"),
+    ("generic", "通用 Webhook"),
+]
+NOTIFY_EVENT_DEFS = [
+    ("task_start", "任务开始"),
+    ("task_done", "任务完成"),
+    ("task_failed", "任务失败"),
+    ("download_reconnect", "下载重连"),
+    ("download_interrupted", "下载中断"),
+    ("heartbeat", "服务自检异常"),
+]
+NOTIFY_ACTION_NAMES = {
+    "merge": "视频合并",
+    "convert": "格式转换",
+    "compress": "视频压缩",
+    "trim": "截取片段",
+    "extract_audio": "提取音频",
+    "subtitle": "字幕烧录",
+    "resize": "修改分辨率",
+    "rotate": "旋转 / 翻转",
+    "screenshot": "视频截图",
+    "custom": "自定义命令",
+    "download": "链接下载",
+}
+NOTIFY_NETWORK_HINTS = (
+    "connection reset", "connection refused", "connection aborted", "timed out",
+    "timeout", "will reconnect", "reconnecting", "http error", "server returned",
+    "i/o error", "network is unreachable", "broken pipe", "end of file",
+    "ssl", "tls", "unexpected eof",
+)
+
+NOTIFY_CHANNELS = []
+NOTIFY_OPTIONS = {"heartbeat_interval": HEARTBEAT_INTERVAL_DEFAULT, "min_interval": 5}
+NOTIFY_LOCK = threading.Lock()
+NOTIFY_COND = threading.Condition(NOTIFY_LOCK)
+NOTIFY_QUEUE = []
+NOTIFY_SEEN = {}
+NOTIFY_HISTORY = []
+NOTIFY_LAST_SEND = {}
+NOTIFY_WORKER_STARTED = False
+
+
+def notify_types_payload():
+    return [{"id": key, "name": name} for key, name in NOTIFY_TYPES]
+
+
+def notify_events_payload():
+    return [{"id": key, "name": name} for key, name in NOTIFY_EVENT_DEFS]
+
+
+def _notify_str(value, limit=2000):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) > limit:
+        text = text[:limit]
+    return text
+
+
+def _notify_url_ok(url):
+    if not url or len(url) > 2048:
+        return False
+    if any(ch in url for ch in ("\r", "\n", " ")):
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def normalize_notify_channel(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("渠道配置格式不正确")
+    ctype = _notify_str(raw.get("type"), 20)
+    if ctype not in dict(NOTIFY_TYPES):
+        raise ValueError("不支持的通知渠道类型")
+    url = _notify_str(raw.get("url"), 2048)
+    if not _notify_url_ok(url):
+        raise ValueError("Webhook 地址必须是 http/https 完整地址")
+    name = _notify_str(raw.get("name"), 40) or dict(NOTIFY_TYPES)[ctype]
+    msgtype = _notify_str(raw.get("msgtype"), 20).lower()
+    if msgtype not in ("markdown", "text"):
+        msgtype = "text" if ctype == "feishu" else "markdown"
+    secret = _notify_str(raw.get("secret"), 512)
+    if any(ch in secret for ch in ("\r", "\n")):
+        raise ValueError("加签密钥不能包含换行")
+
+    headers = {}
+    raw_headers = raw.get("headers")
+    if isinstance(raw_headers, str):
+        raw_headers = raw_headers.strip()
+        if raw_headers:
+            try:
+                raw_headers = json.loads(raw_headers)
+            except ValueError:
+                raise ValueError("自定义请求头必须是 JSON 对象")
+    if isinstance(raw_headers, dict):
+        for key, value in list(raw_headers.items())[:20]:
+            hkey = _notify_str(key, 80)
+            hval = _notify_str(value, 1000)
+            if not hkey or any(ch in hkey + hval for ch in ("\r", "\n")):
+                raise ValueError("自定义请求头不合法")
+            headers[hkey] = hval
+
+    template = _notify_str(raw.get("template"), 4000)
+    events = []
+    raw_events = raw.get("events")
+    if isinstance(raw_events, list):
+        for item in raw_events:
+            item = str(item or "").strip()
+            if item in dict(NOTIFY_EVENT_DEFS) and item not in events:
+                events.append(item)
+
+    channel_id = _notify_str(raw.get("id"), 64)
+    if not re.match(r"^[A-Za-z0-9_-]{1,64}$", channel_id or ""):
+        channel_id = "ch_" + uuid.uuid4().hex[:12]
+
+    return {
+        "id": channel_id,
+        "type": ctype,
+        "name": name,
+        "url": url,
+        "secret": secret,
+        "msgtype": msgtype,
+        "headers": headers,
+        "template": template,
+        "events": events,
+        "enabled": bool(raw.get("enabled", True)),
+    }
+
+
+def notify_config_payload():
+    with NOTIFY_LOCK:
+        channels = [dict(ch) for ch in NOTIFY_CHANNELS]
+        options = dict(NOTIFY_OPTIONS)
+    return {
+        "channels": channels,
+        "options": options,
+        "types": notify_types_payload(),
+        "events": notify_events_payload(),
+        "config_path": NOTIFY_PATH,
+    }
+
+
+def load_notify():
+    global NOTIFY_CHANNELS, NOTIFY_OPTIONS
+    channels = []
+    options = {"heartbeat_interval": HEARTBEAT_INTERVAL_DEFAULT, "min_interval": 5}
+    data = {}
+    try:
+        with open(NOTIFY_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        data = {}
+    if isinstance(data, dict):
+        raw_options = data.get("options")
+        if isinstance(raw_options, dict):
+            options = {
+                "heartbeat_interval": clamp_int(raw_options.get("heartbeat_interval"), 60, 3600,
+                                                HEARTBEAT_INTERVAL_DEFAULT),
+                "min_interval": clamp_int(raw_options.get("min_interval"), 1, 60, 5),
+            }
+        raw_channels = data.get("channels")
+        if isinstance(raw_channels, list):
+            for raw in raw_channels[:NOTIFY_MAX_CHANNELS]:
+                try:
+                    channels.append(normalize_notify_channel(raw))
+                except ValueError:
+                    continue
+    with NOTIFY_LOCK:
+        NOTIFY_CHANNELS = channels
+        NOTIFY_OPTIONS = options
+
+
+def save_notify(channels, options):
+    data = {
+        "version": 1,
+        "channels": channels,
+        "options": options,
+    }
+    try:
+        os.makedirs(PKGVAR, exist_ok=True)
+        tmp = NOTIFY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, NOTIFY_PATH)
+    except OSError as exc:
+        raise ValueError("保存通知配置失败：%s" % exc)
+
+
+def notify_has_event(event):
+    with NOTIFY_LOCK:
+        for ch in NOTIFY_CHANNELS:
+            if ch.get("enabled") and event in ch.get("events", []):
+                return True
+    return False
+
+
+# ---------------- 渠道发送 ----------------
+
+def dingtalk_sign(secret):
+    timestamp = str(int(time.time() * 1000))
+    string_to_sign = "%s\n%s" % (timestamp, secret)
+    digest = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"),
+                      hashlib.sha256).digest()
+    sign = quote_plus(base64.b64encode(digest).decode("utf-8"))
+    return timestamp, sign
+
+
+def _notify_payload(ch, title, text, event):
+    ctype = ch.get("type") or ""
+    line = (title + "\n" + text).strip()
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if ctype == "wecom":
+        if ch.get("msgtype") == "text":
+            payload = {"msgtype": "text", "text": {"content": line}}
+        else:
+            payload = {"msgtype": "markdown",
+                       "markdown": {"content": "**%s**\n%s" % (title, text)}}
+        return headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if ctype == "feishu":
+        payload = {"msg_type": "text", "content": {"text": line}}
+        return headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if ctype == "dingtalk":
+        if ch.get("msgtype") == "text":
+            payload = {"msgtype": "text", "text": {"content": line}}
+        else:
+            payload = {"msgtype": "markdown",
+                       "markdown": {"title": title, "text": line}}
+        secret = ch.get("secret") or ""
+        if secret:
+            timestamp, sign = dingtalk_sign(secret)
+            payload["timestamp"] = timestamp
+            payload["sign"] = sign
+        return headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    # 通用 Webhook：自定义 JSON 模板或默认 JSON
+    headers = dict(ch.get("headers") or {})
+    template = (ch.get("template") or "").strip()
+    if template:
+        looks_json = template.lstrip()[:1] in ("{", "[")
+
+        def fill(value):
+            # JSON 模板中占位符位于字符串内部，需要转义换行、引号与反斜杠
+            return json.dumps(value, ensure_ascii=False)[1:-1] if looks_json else value
+
+        body_text = (template
+                     .replace("{{title}}", fill(title))
+                     .replace("{{message}}", fill(text))
+                     .replace("{{event}}", fill(event))
+                     .replace("{{time}}", fill(time.strftime("%Y-%m-%d %H:%M:%S"))))
+        if not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = ("application/json; charset=utf-8" if looks_json
+                                       else "text/plain; charset=utf-8")
+        return headers, body_text.encode("utf-8")
+
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    payload = {
+        "event": event,
+        "title": title,
+        "message": text,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return headers, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _notify_http_post(url, headers, body, timeout):
+    req = urllib.request.Request(url, data=body, method="POST")
+    for key, value in headers.items():
+        req.add_header(key, value)
+    opener = urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read(8192)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(8192)
+        except Exception:
+            raw = b""
+        return exc.code, raw
+
+
+def _notify_api_error(ctype, raw):
+    if ctype == "generic":
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8", "replace") or "{}")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = None
+    for key in ("errcode", "code", "StatusCode", "status_code"):
+        if key in data:
+            code = data.get(key)
+            break
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        return None
+    if code_int == 0:
+        return None
+    message = data.get("errmsg") or data.get("msg") or data.get("message") or "接口返回错误"
+    return "接口返回错误（code=%s）：%s" % (code_int, str(message)[:200])
+
+
+def notify_deliver(ch, title, text, event, timeout=NOTIFY_TIMEOUT, retries=NOTIFY_RETRIES):
+    """向单个渠道发送消息；返回 (ok, detail, http_status)。"""
+    attempts = max(1, int(retries) + 1)
+    status = None
+    detail = "发送失败"
+    for attempt in range(attempts):
+        headers, body = _notify_payload(ch, title, text, event)
+        try:
+            status, raw = _notify_http_post(ch.get("url") or "", headers, body, timeout)
+        except urllib.error.URLError as exc:
+            status = None
+            detail = "连接失败：%s" % (exc.reason,)
+        except (OSError, ValueError) as exc:
+            status = None
+            if "timed out" in str(exc).lower():
+                detail = "连接超时（%s 秒）" % timeout
+            else:
+                detail = "发送失败：%s" % exc
+        else:
+            body_text = raw.decode("utf-8", "replace").strip()
+            api_error = _notify_api_error(ch.get("type"), raw)
+            if status >= 400:
+                snippet = body_text[:200] or "无响应内容"
+                detail = "HTTP %s：%s" % (status, snippet)
+            elif api_error:
+                detail = api_error
+            else:
+                detail = "发送成功（HTTP %s）" % status
+                return True, detail, status
+        if attempt + 1 < attempts:
+            time.sleep(1.0)
+    return False, detail, status
+
+
+# ---------------- 事件分发与去重 ----------------
+
+def _notify_duration(seconds):
+    try:
+        seconds = int(max(0, float(seconds)))
+    except (TypeError, ValueError):
+        seconds = 0
+    h, remain = divmod(seconds, 3600)
+    m, s = divmod(remain, 60)
+    return ("%d:%02d:%02d" % (h, m, s)) if h else ("%02d:%02d" % (m, s))
+
+
+def notify_event(event, title, lines, task_id=""):
+    key = "%s|%s|%s" % (event, task_id or "-", title)
+    now = time.time()
+    with NOTIFY_COND:
+        for ch in NOTIFY_CHANNELS:
+            if not ch.get("enabled") or event not in ch.get("events", []):
+                continue
+            NOTIFY_QUEUE.append({
+                "channel": dict(ch),
+                "event": event,
+                "title": title,
+                "lines": [str(x) for x in lines if x],
+                "key": key,
+                "at": now,
+            })
+        NOTIFY_COND.notify()
+
+
+def _notify_record(ch, event, ok, detail):
+    with NOTIFY_LOCK:
+        NOTIFY_HISTORY.append({
+            "time": time.time(),
+            "channel": ch.get("name") or ch.get("id"),
+            "type": ch.get("type"),
+            "event": event,
+            "ok": bool(ok),
+            "detail": detail,
+        })
+        if len(NOTIFY_HISTORY) > NOTIFY_HISTORY_MAX:
+            del NOTIFY_HISTORY[:len(NOTIFY_HISTORY) - NOTIFY_HISTORY_MAX]
+
+
+def _notify_dispatch(batch):
+    groups = {}
+    for entry in batch:
+        groups.setdefault(entry["channel"]["id"], []).append(entry)
+
+    for entries in groups.values():
+        ch = entries[0]["channel"]
+        now = time.time()
+        fresh = []
+        with NOTIFY_LOCK:
+            for entry in entries:
+                seen_key = "%s|%s" % (ch["id"], entry["key"])
+                seen_at = NOTIFY_SEEN.get(seen_key)
+                if seen_at and now - seen_at < NOTIFY_SEEN_TTL:
+                    continue
+                NOTIFY_SEEN[seen_key] = now
+                fresh.append(entry)
+            if len(NOTIFY_SEEN) > 2000:
+                cutoff = now - NOTIFY_SEEN_TTL
+                for key in [k for k, v in NOTIFY_SEEN.items() if v < cutoff]:
+                    NOTIFY_SEEN.pop(key, None)
+            min_gap = NOTIFY_OPTIONS.get("min_interval", 5)
+            last = NOTIFY_LAST_SEND.get(ch["id"], 0.0)
+        if not fresh:
+            continue
+        wait = last + min_gap - time.time()
+        if wait > 0:
+            time.sleep(min(wait, float(min_gap)))
+
+        if len(fresh) == 1:
+            title = fresh[0]["title"]
+            text = "\n".join(fresh[0]["lines"])
+            event = fresh[0]["event"]
+        else:
+            title = "【视频助手】批量通知（%d 条）" % len(fresh)
+            text = "\n\n".join(e["title"] + "\n" + "\n".join(e["lines"]) for e in fresh)
+            event = "digest"
+
+        ok, detail, _status = notify_deliver(ch, title, text, event)
+        with NOTIFY_LOCK:
+            NOTIFY_LAST_SEND[ch["id"]] = time.time()
+        _notify_record(ch, event, ok, detail)
+        if not ok:
+            sys.stderr.write("notify: %s 发送失败：%s\n" % (ch.get("name"), detail))
+
+
+def _notify_worker():
+    while True:
+        with NOTIFY_COND:
+            if not NOTIFY_QUEUE:
+                NOTIFY_COND.wait(1.0)
+                continue
+            # 短暂合并窗口：短时间内的多条事件合并成一条，避免连续失败刷屏
+            deadline = time.time() + NOTIFY_BATCH_WAIT
+            while time.time() < deadline and len(NOTIFY_QUEUE) < 20:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                NOTIFY_COND.wait(remain)
+            batch = NOTIFY_QUEUE[:20]
+            del NOTIFY_QUEUE[:20]
+        try:
+            _notify_dispatch(batch)
+        except Exception as exc:
+            sys.stderr.write("notify: 分发异常：%s\n" % exc)
+
+
+def start_notify_threads():
+    global NOTIFY_WORKER_STARTED
+    with NOTIFY_LOCK:
+        if NOTIFY_WORKER_STARTED:
+            return
+        NOTIFY_WORKER_STARTED = True
+    threading.Thread(target=_notify_worker, daemon=True).start()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
+
+# ---------------- 任务与心跳事件 ----------------
+
+def _task_meta(task):
+    meta = task.get("meta") or {}
+    label = meta.get("label") or NOTIFY_ACTION_NAMES.get(task.get("action"),
+                                                          task.get("action") or "-")
+    return label, meta
+
+
+def _task_output_size(task):
+    meta = task.get("meta") or {}
+    path = meta.get("output_abs") or ""
+    if not path:
+        return 0
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _task_failure_reason(task):
+    logs = task.get("log") or []
+    hints = ("error", "failed", "invalid", "not found", "no such", "unable", "denied",
+             "timed out", "timeout", "connection", "http error", "server returned",
+             "will reconnect", "reconnect")
+    for line in reversed(logs[-100:]):
+        low = line.lower()
+        if any(h in low for h in hints):
+            return line.strip()[:400]
+    code = task.get("returncode")
+    if code not in (None, 0):
+        return "ffmpeg 返回码 %s" % code
+    return "任务执行失败，请查看任务日志"
+
+
+def _task_is_network_failure(task):
+    logs = task.get("log") or []
+    for line in logs[-100:]:
+        low = line.lower()
+        if any(h in low for h in NOTIFY_NETWORK_HINTS):
+            return True
+    return False
+
+
+def notify_task_started(task):
+    if not notify_has_event("task_start"):
+        return
+    label, meta = _task_meta(task)
+    lines = ["任务：%s" % label]
+    if meta.get("input"):
+        lines.append("来源：%s" % meta["input"])
+    if meta.get("output"):
+        lines.append("输出：%s" % meta["output"])
+    lines.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    notify_event("task_start", "【视频助手】任务开始", lines, task_id=task["id"])
+
+
+def notify_download_reconnect(task, detail):
+    if not notify_has_event("download_reconnect"):
+        return
+    label, meta = _task_meta(task)
+    lines = ["任务：%s" % label]
+    if meta.get("output"):
+        lines.append("输出：%s" % meta["output"])
+    lines.append("情况：%s" % detail)
+    lines.append("说明：ffmpeg 正在自动重连，若持续失败会再发中断通知。")
+    notify_event("download_reconnect", "【视频助手】下载重连", lines, task_id=task["id"])
+
+
+def notify_task_finished(task):
+    status = task.get("status")
+    if status not in ("done", "failed"):
+        return
+    label, meta = _task_meta(task)
+    elapsed = max(0.0, (task.get("finished") or time.time()) - (task.get("created") or time.time()))
+    lines = ["任务：%s" % label]
+    if meta.get("input"):
+        lines.append("来源：%s" % meta["input"])
+    if meta.get("output"):
+        lines.append("输出：%s" % meta["output"])
+    lines.append("耗时：%s" % _notify_duration(elapsed))
+    size = _task_output_size(task)
+    if size:
+        lines.append("大小：%s" % human_size(size))
+
+    event = "task_done" if status == "done" else "task_failed"
+    title = "【视频助手】任务完成" if status == "done" else "【视频助手】任务失败"
+    if status == "failed":
+        reason = _task_failure_reason(task)
+        lines.append("原因：%s" % reason)
+        if task.get("action") == "download" and _task_is_network_failure(task):
+            event = "download_interrupted"
+            title = "【视频助手】下载中断"
+            lines.append("提示：网络中断或分片不可达，可在下载页重新发起。")
+    if not notify_has_event(event):
+        return
+    notify_event(event, title, lines, task_id=task["id"])
+
+
+def _notify_self_check():
+    """服务自检：ffmpeg 可用 + 配置目录可读写。"""
+    try:
+        resolve_binaries()
+    except Exception as exc:
+        return False, "自检异常：%s" % exc
+    if not FFMPEG_BIN:
+        return False, FFMPEG_ERROR or "未找到系统 ffmpeg"
+    try:
+        out = subprocess.run([FFMPEG_BIN, "-version"], capture_output=True, text=True,
+                             timeout=10)
+        if out.returncode != 0:
+            return False, "ffmpeg 自检返回码 %s" % out.returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "ffmpeg 自检失败：%s" % exc
+    try:
+        os.makedirs(PKGVAR, exist_ok=True)
+    except OSError as exc:
+        return False, "配置目录不可用：%s" % exc
+    if not os.access(PKGVAR, os.R_OK | os.W_OK | os.X_OK):
+        return False, "配置目录不可读写：%s" % PKGVAR
+    return True, ""
+
+
+def _heartbeat_loop():
+    fails = 0
+    last_alert = 0.0
+    while True:
+        with NOTIFY_LOCK:
+            interval = int(NOTIFY_OPTIONS.get("heartbeat_interval") or HEARTBEAT_INTERVAL_DEFAULT)
+        time.sleep(max(60, min(3600, interval)))
+        if not notify_has_event("heartbeat"):
+            fails = 0
+            continue
+        ok, reason = _notify_self_check()
+        if ok:
+            if fails >= HEARTBEAT_FAIL_THRESHOLD:
+                notify_event("heartbeat", "【视频助手】服务自检恢复",
+                             ["服务自检已恢复正常。",
+                              "说明：本通知为尽力而为，进程被系统终止或宿主机断电时无法发出。"],
+                             task_id="heartbeat-recovered-%d" % int(time.time() // 3600))
+            fails = 0
+            continue
+        fails += 1
+        now = time.time()
+        if fails >= HEARTBEAT_FAIL_THRESHOLD and now - last_alert >= 3600:
+            last_alert = now
+            notify_event("heartbeat", "【视频助手】服务自检异常",
+                         ["连续 %d 次自检失败。" % fails,
+                          "原因：%s" % reason,
+                          "说明：心跳检测只能发现服务仍在运行但自检失败的情况；进程崩溃、被系统杀死或宿主机断电时无法自行发出通知，请配合外部监控。"],
+                         task_id="heartbeat-alert-%d" % int(now // 3600))
+
+
+# --------------------------------------------------------------------------
 # 工具函数
 # --------------------------------------------------------------------------
 
@@ -596,6 +1233,15 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
                     parse_progress(task, line)
                     if not PROGRESS_LINE_RE.match(line):
                         log_line(task, line)
+                        if (task.get("action") == "download"
+                                and not task.get("reconnect_notified")):
+                            low = line.lower()
+                            if "will reconnect" in low or "reconnecting" in low:
+                                task["reconnect_notified"] = True
+                                try:
+                                    notify_download_reconnect(task, line.strip()[:200])
+                                except Exception:
+                                    pass
         if pending.strip() and not PROGRESS_LINE_RE.match(pending.strip()):
             log_line(task, pending.strip())
         code = proc.wait()
@@ -627,10 +1273,14 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
                 os.remove(partial)
             except OSError:
                 pass
+        try:
+            notify_task_finished(task)
+        except Exception:
+            pass
 
 
 def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
-               total_bytes=None, partial=None):
+               total_bytes=None, partial=None, meta=None):
     task_id = uuid.uuid4().hex
     task = {
         "id": task_id,
@@ -650,6 +1300,7 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "total_bytes": total_bytes,
         "written": 0,
         "elapsed": 0.0,
+        "meta": meta or {},
     }
     with TASKS_LOCK:
         TASKS[task_id] = task
@@ -663,6 +1314,10 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         log_line(task, note)
     threading.Thread(target=run_task, args=(task_id, cmd, duration, cleanup, partial),
                      daemon=True).start()
+    try:
+        notify_task_started(task)
+    except Exception:
+        pass
     return task
 
 
@@ -1429,6 +2084,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_probe()
             elif path == "/api/tasks":
                 self.api_tasks()
+            elif path == "/api/notify":
+                self.send_json(notify_config_payload())
+            elif path == "/api/notify/log":
+                self.api_notify_log()
             elif path.startswith("/api/log/"):
                 self.api_log(path[len("/api/log/"):])
             else:
@@ -1653,6 +2312,12 @@ class Handler(BaseHTTPRequestHandler):
             }
         self.send_json(payload)
 
+    def api_notify_log(self):
+        with NOTIFY_LOCK:
+            items = [dict(x) for x in NOTIFY_HISTORY[-50:]]
+        items.reverse()
+        self.send_json({"items": items, "config_path": NOTIFY_PATH})
+
     # ---------------- POST ----------------
 
     def do_POST(self):
@@ -1666,6 +2331,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_mkdir()
             elif path == "/api/task":
                 self.api_task()
+            elif path == "/api/notify":
+                self.api_save_notify()
+            elif path == "/api/notify/test":
+                self.api_notify_test()
             elif path.startswith("/api/cancel/"):
                 self.api_cancel(path[len("/api/cancel/"):])
             else:
@@ -1780,6 +2449,63 @@ class Handler(BaseHTTPRequestHandler):
         add_root(parent)
         self.send_json({"ok": True, "path": path})
 
+    def api_save_notify(self):
+        global NOTIFY_CHANNELS, NOTIFY_OPTIONS
+        data = self.read_json()
+        raw_channels = data.get("channels")
+        if not isinstance(raw_channels, list):
+            raise ValueError("缺少渠道配置")
+        if len(raw_channels) > NOTIFY_MAX_CHANNELS:
+            raise ValueError("最多支持 %d 个通知渠道" % NOTIFY_MAX_CHANNELS)
+        channels = [normalize_notify_channel(raw) for raw in raw_channels]
+
+        options = {"heartbeat_interval": HEARTBEAT_INTERVAL_DEFAULT, "min_interval": 5}
+        raw_options = data.get("options")
+        if isinstance(raw_options, dict):
+            options = {
+                "heartbeat_interval": clamp_int(raw_options.get("heartbeat_interval"),
+                                                60, 3600, HEARTBEAT_INTERVAL_DEFAULT),
+                "min_interval": clamp_int(raw_options.get("min_interval"), 1, 60, 5),
+            }
+        save_notify(channels, options)
+        with NOTIFY_LOCK:
+            NOTIFY_CHANNELS = channels
+            NOTIFY_OPTIONS = options
+        payload = notify_config_payload()
+        payload["ok"] = True
+        self.send_json(payload)
+
+    def api_notify_test(self):
+        data = self.read_json()
+        raw = data.get("channel")
+        channel_id = str(data.get("id") or "").strip()
+        if not isinstance(raw, dict) and channel_id:
+            with NOTIFY_LOCK:
+                for ch in NOTIFY_CHANNELS:
+                    if ch.get("id") == channel_id:
+                        raw = dict(ch)
+                        break
+        if not isinstance(raw, dict):
+            raise ValueError("请提供要测试的渠道配置")
+        channel = normalize_notify_channel(raw)
+
+        title = "【视频助手】测试通知"
+        lines = [
+            "这是一条测试消息，收到即表示 Webhook 配置可用。",
+            "渠道：%s（%s）" % (channel["name"], dict(NOTIFY_TYPES)[channel["type"]]),
+            "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        started = time.time()
+        ok, detail, status = notify_deliver(channel, title, "\n".join(lines), "test",
+                                            retries=0)
+        self.send_json({
+            "ok": ok,
+            "error": "" if ok else detail,
+            "detail": detail,
+            "http_status": status,
+            "elapsed_ms": int((time.time() - started) * 1000),
+        })
+
     def api_task(self):
         data = self.read_json()
         action = (data.get("action") or "").strip()
@@ -1799,8 +2525,35 @@ class Handler(BaseHTTPRequestHandler):
             tool = "ffmpeg"
             cmd, duration, cleanup = build_ffmpeg(action, params)
 
+        meta = {"label": NOTIFY_ACTION_NAMES.get(action, action)}
+        if action == "merge":
+            files = params.get("files") or []
+            if isinstance(files, list) and files:
+                first = os.path.basename(str(files[0]))
+                meta["input"] = (first + (" 等 %d 个文件" % len(files))
+                                 if len(files) > 1 else first)
+            meta["output"] = str(params.get("output") or "")
+        elif action == "download":
+            parsed = urlparse(str(params.get("url") or ""))
+            shown = ((parsed.hostname or "") + (parsed.path or ""))[:120]
+            meta["input"] = shown or "链接"
+            subdir = str(params.get("subdir") or "").strip().strip("/")
+            name = str(params.get("filename") or "").strip() or "自动命名"
+            meta["output"] = (subdir + "/" if subdir else "") + name
+            meta["output_abs"] = partial or ""
+        else:
+            source = str(params.get("input") or "")
+            meta["input"] = os.path.basename(source) if source else ""
+            meta["output"] = str(params.get("output") or "")
+        if not meta.get("output_abs") and meta.get("output"):
+            try:
+                meta["output_abs"] = output_path(meta["output"])
+            except ValueError:
+                meta["output_abs"] = ""
+
         task = start_task(tool, action, cmd, duration=duration, cleanup=cleanup,
-                          note=note, total_bytes=total_bytes, partial=partial)
+                          note=note, total_bytes=total_bytes, partial=partial,
+                          meta=meta)
         self.send_json({"task": task["id"], "cmd": task["cmd"]})
 
     def api_cancel(self, task_id):
@@ -1842,6 +2595,8 @@ def main():
     args = parser.parse_args()
 
     load_config()
+    load_notify()
+    start_notify_threads()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
 

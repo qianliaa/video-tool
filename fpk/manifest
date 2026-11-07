@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.3.7
+version               = 1.3.8
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 移除访问密码与登录：删除首次设置密码、登录、退出界面及会话过期拦截，后端删除认证接口、会话校验、Cookie 与密码派生；同时去掉 Host 白名单与 Origin/Content-Type 校验，修复反向代理场景误报 403；遗留 auth.json 不再读取，所有接口恢复无需认证直接访问；检查更新、发布者信息、任务与下载保持不变
+changelog             = 新增通知设置：可配置多个企业微信 / 飞书 / 钉钉 / 通用 Webhook 渠道，按任务开始、完成、失败、下载重连、下载中断与心跳异常推送；支持发送测试并显示失败原因、事件去重与连续失败合并、超时与重试上限；通知失败不影响下载与转码；渠道配置含敏感信息保存在配置目录 notify.json，界面遮挡显示
 platform              = x86
 source                = thirdparty
 maintainer            = 千里
