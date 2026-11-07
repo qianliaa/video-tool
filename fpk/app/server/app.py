@@ -45,7 +45,7 @@ URL_MEDIA_EXTS = (".m3u8", ".mpd", ".mp4", ".mkv", ".mov", ".m4v", ".webm",
                   ".wav", ".ogg", ".opus")
 DOWNLOAD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
-               "Chrome/126.0 Safari/537.36 VideoTool/1.3.1")
+               "Chrome/126.0 Safari/537.36 VideoTool/1.3.2")
 MAX_PAGE_BYTES = 2 * 1024 * 1024
 MAX_SCAN_FILES = 5000
 MAX_SCAN_DEPTH = 8
@@ -1096,7 +1096,7 @@ def build_download(p):
 # --------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoTool/1.3.1"
+    server_version = "VideoTool/1.3.2"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
