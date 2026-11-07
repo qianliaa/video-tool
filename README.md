@@ -83,7 +83,7 @@ rm -f /vol1/@appdata/video-tool/auth.json
 python pack.py
 ```
 
-输出 `video-tool.fpk`，在飞牛应用中心手动安装即可。
+输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.4.fpk`），在飞牛应用中心手动安装即可。
 
 打包脚本会：
 

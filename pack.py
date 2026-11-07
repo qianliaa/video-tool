@@ -1,8 +1,20 @@
-﻿import os, tarfile, sys, io
+﻿import os, re, tarfile, sys, io
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(BASE, "fpk")
-OUT = os.path.join(BASE, "video-tool.fpk")
+
+
+def package_version():
+    """从 fpk/manifest 读取版本号，产物名随版本变化。"""
+    with open(os.path.join(SRC, "manifest"), "r", encoding="utf-8-sig") as fp:
+        for line in fp:
+            m = re.match(r"\s*version\s*=\s*([^\s#]+)", line)
+            if m:
+                return m.group(1)
+    print("MISSING: manifest version"); sys.exit(1)
+
+
+OUT = os.path.join(BASE, "video-tool-%s.fpk" % package_version())
 
 TEXT_EXTS = {".py", ".html", ".htm", ".css", ".js", ".json", ".txt",
              ".md", ".sh", ".conf", ".ini", ".yml", ".yaml", ".xml"}
