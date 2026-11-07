@@ -75,16 +75,7 @@ rm -f /vol1/@appdata/video-tool/auth.json
 - 先在 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」中授权目标文件夹，再在应用内选择；看不到文件夹时，可直接从「文件管理」复制原始路径粘贴到设置或选择器中
 - 路径必须是完整绝对路径（如 `/vol1/1000/视频`），并具备输入读取、输出写入权限
 
-目录配置保存在 `${TRIM_PKGVAR}/config.json`，FFmpeg 来源与手动路径也保存在同一文件。
-
-## FFmpeg 来源
-
-设置页可选择任务执行时使用的 ffmpeg 来源，选择会立即保存到配置：
-
-- **本地**（默认）：使用应用目录下的 `bin/ffmpeg`（Windows 下也兼容 `bin/ffmpeg.exe`）。当前版本未内置 ffmpeg 二进制，可在设置页手动指定任意可执行的 ffmpeg 完整路径。
-- **系统原生**：使用系统已安装的 ffmpeg，按 PATH、`/usr/bin`、`/usr/local/bin`、飞牛应用目录依次查找。
-
-任务执行时按所选来源解析二进制；路径不存在、不可执行或不是 ffmpeg 时会直接返回明确错误，不会静默回退到另一种来源，也不会让任务停在 0%。已有配置升级到 1.3.5 时会自动迁移为「系统原生」，避免升级后任务不可用；新装默认「本地」。
+目录配置保存在 `${TRIM_PKGVAR}/config.json`。
 
 ## 检查更新
 
@@ -98,7 +89,7 @@ rm -f /vol1/@appdata/video-tool/auth.json
 python pack.py
 ```
 
-输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.5.fpk`），在飞牛应用中心手动安装即可。
+输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.6.fpk`），在飞牛应用中心手动安装即可。
 
 打包脚本会：
 
@@ -109,7 +100,7 @@ python pack.py
 ## 运行依赖
 
 - Python 3.11（飞牛应用中心的 Python 3.11，manifest 中通过 `install_dep_apps` 声明）
-- ffmpeg（含 ffprobe）：可使用应用内置的 `bin/ffmpeg`、设置页手动指定的本地路径，或系统已安装的 ffmpeg；安装包里当前不附带 ffmpeg 二进制
+- ffmpeg（含 ffprobe）：使用系统已安装的 ffmpeg，按 PATH、`/usr/bin`、`/usr/local/bin`、飞牛应用目录依次查找；找不到时会给出明确错误
 - 不再内置 yt-dlp，也没有其他第三方 Python 依赖
 
 后端只使用 Python 标准库，不依赖 Flask / pip / venv，安装后即可启动。
