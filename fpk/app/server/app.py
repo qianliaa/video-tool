@@ -448,21 +448,31 @@ def log_line(task, line):
         task["log"].insert(0, "... 日志过长，已截断 ...")
 
 
+# ffmpeg -progress 输出的 key=value 行，只用于统计进度，不写进任务日志
+PROGRESS_LINE_RE = re.compile(
+    r"^(progress=|frame=|fps=|bitrate=|total_size=|out_time|dup_frames=|drop_frames=|speed=)")
+
+
 def parse_progress(task, line):
     total = task.get("total_bytes")
-    if total:
-        m = re.search(r"total_size=(\d+)", line)
-        if m:
+    m = re.search(r"total_size=(\d+)", line)
+    if m:
+        task["written"] = int(m.group(1))
+        if total:
             task["progress"] = min(99.0, int(m.group(1)) / float(total) * 100.0)
-    if task.get("duration"):
-        m = re.search(r"out_time_(?:ms|us)=(\d+)", line)
-        if m:
-            secs = int(m.group(1)) / 1000000.0
+    # 注意：ffmpeg 的 out_time_ms 实际是微秒（与 out_time_us 同值）
+    m = re.search(r"out_time_(?:ms|us)=(\d+)", line)
+    if m:
+        secs = int(m.group(1)) / 1000000.0
+        task["elapsed"] = secs
+        if task.get("duration"):
             task["progress"] = min(99.0, secs / task["duration"] * 100.0)
-            return
+        return
+    if task.get("duration"):
         m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
         if m:
             secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            task["elapsed"] = secs
             task["progress"] = min(99.0, secs / task["duration"] * 100.0)
 
 
@@ -492,9 +502,10 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
             for line in parts:
                 line = line.rstrip()
                 if line:
-                    log_line(task, line)
                     parse_progress(task, line)
-        if pending.strip():
+                    if not PROGRESS_LINE_RE.match(line):
+                        log_line(task, line)
+        if pending.strip() and not PROGRESS_LINE_RE.match(pending.strip()):
             log_line(task, pending.strip())
         code = proc.wait()
         with TASKS_LOCK:
@@ -536,7 +547,8 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "action": action,
         "cmd": " ".join(shlex.quote(x) for x in cmd),
         "status": "running",
-        "progress": 0.0,
+        # 拿不到总时长/总字节时用 -1 表示进度未知，避免界面一直显示 0%
+        "progress": 0.0 if (duration or total_bytes) else -1.0,
         "log": [],
         "created": time.time(),
         "finished": None,
@@ -545,6 +557,8 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "canceled": False,
         "duration": duration,
         "total_bytes": total_bytes,
+        "written": 0,
+        "elapsed": 0.0,
     }
     with TASKS_LOCK:
         TASKS[task_id] = task
@@ -941,6 +955,20 @@ def hls_variants(text, base_url):
     return variants
 
 
+def hls_duration(text):
+    """按 EXTINF 累计媒体播放列表的总时长，拿不到就返回 None。"""
+    total = 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("#EXTINF:"):
+            continue
+        try:
+            total += float(line.split(":", 1)[1].split(",", 1)[0])
+        except ValueError:
+            continue
+    return total if total > 0 else None
+
+
 def pick_variant(variants, quality):
     if not variants:
         return None
@@ -995,6 +1023,7 @@ def build_download(p):
     media_url, kind, title = resolve_media(url, headers, proxy)
 
     note = ["下载引擎：ffmpeg", "媒体类型：%s" % {"hls": "HLS", "dash": "DASH"}.get(kind, "直链媒体")]
+    total_time = None
     if kind == "hls":
         try:
             text, _, final_url = fetch_text(media_url, headers, proxy)
@@ -1005,6 +1034,8 @@ def build_download(p):
                 note.append("画质：%s" % (
                     "%dx%d" % (selected["width"], selected["height"])
                     if selected["width"] else "%d kbps" % (selected["bandwidth"] // 1000)))
+                text, _, final_url = fetch_text(media_url, headers, proxy)
+            total_time = hls_duration(text)
         except ValueError:
             pass
 
@@ -1057,7 +1088,7 @@ def build_download(p):
     cmd += [out]
 
     total_bytes = None if kind in ("hls", "dash") else content_length(media_url, headers, proxy)
-    return cmd, None, None, "\n".join(note), total_bytes, out
+    return cmd, total_time, None, "\n".join(note), total_bytes, out
 
 
 # --------------------------------------------------------------------------
@@ -1327,6 +1358,8 @@ class Handler(BaseHTTPRequestHandler):
                     "action": task["action"],
                     "status": task["status"],
                     "progress": task["progress"],
+                    "written": task.get("written", 0),
+                    "elapsed": task.get("elapsed", 0.0),
                     "created": task["created"],
                     "finished": task["finished"],
                 })
@@ -1342,6 +1375,8 @@ class Handler(BaseHTTPRequestHandler):
                 "id": task["id"],
                 "status": task["status"],
                 "progress": task["progress"],
+                "written": task.get("written", 0),
+                "elapsed": task.get("elapsed", 0.0),
                 "returncode": task["returncode"],
                 "log": list(task["log"]),
             }

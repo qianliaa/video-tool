@@ -874,6 +874,15 @@ details.adv summary:hover { color: var(--text); }
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   transition: width .4s ease;
 }
+/* 总时长未知时用流动的进度条表示“进行中”，而不是假装 0% */
+.progress-bar.unknown {
+  width: 40%;
+  animation: progress-indeterminate 1.2s linear infinite;
+}
+@keyframes progress-indeterminate {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
 .task-item.done .progress-bar { background: var(--green); }
 .task-item.failed .progress-bar { background: var(--red); }
 .task-item.canceled .progress-bar { background: var(--amber); }

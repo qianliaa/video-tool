@@ -80,6 +80,14 @@
     return h > 0 ? h + ":" + pad(m) + ":" + pad(s) : pad(m) + ":" + pad(s);
   }
 
+  // 拿不到总时长/总大小时，用已写入的大小和已处理时长作为可读进展
+  function taskStat(t) {
+    var parts = [];
+    if (Number(t.elapsed) > 0) parts.push(fmtClock(t.elapsed));
+    if (Number(t.written) > 0) parts.push(fmtSize(t.written));
+    return parts.length ? parts.join(" · ") : "—";
+  }
+
   function fmtDate(ts) {
     if (!ts) return "";
     var d = new Date(ts * 1000);
@@ -559,19 +567,20 @@
     state.tasks.forEach(function (t) {
       var item = document.createElement("div");
       item.className = "task-item " + t.status;
-      var pct = Math.max(0, Math.min(100, Number(t.progress) || 0));
+      var unknown = Number(t.progress) < 0;
+      var pct = unknown ? 0 : Math.max(0, Math.min(100, Number(t.progress) || 0));
       item.innerHTML =
         '<div class="task-top">' +
           '<span class="task-name">' + esc(taskLabel(t)) + '</span>' +
           '<span class="status ' + esc(t.status) + '">' + esc(STATUS_LABEL[t.status] || t.status) + '</span>' +
-          (t.status === "running" ? '<span class="task-time">' + pct.toFixed(0) + '%</span>' : '') +
+          (t.status === "running" ? '<span class="task-time">' + esc(unknown ? taskStat(t) : pct.toFixed(0) + "%") + '</span>' : '') +
           '<span class="task-time">' + esc(fmtDate(t.created)) + '</span>' +
           '<span class="task-actions">' +
             '<button class="btn ghost small" data-log="' + esc(t.id) + '">日志</button>' +
             (t.status === "running" ? '<button class="btn danger small" data-cancel="' + esc(t.id) + '">取消</button>' : '') +
           '</span>' +
         '</div>' +
-        '<div class="progress"><div class="progress-bar" style="width:' + pct + '%"></div></div>';
+        '<div class="progress"><div class="progress-bar' + (unknown ? ' unknown' : '" style="width:' + pct + '%') + '"></div></div>';
       box.appendChild(item);
     });
     $("#tasksEmpty").hidden = state.tasks.length > 0;
@@ -656,15 +665,17 @@
       var text = (data.log || []).join("\n");
       box.textContent = text || "等待输出…";
       if (nearBottom) box.scrollTop = box.scrollHeight;
-      var pct = Math.max(0, Math.min(100, Number(data.progress) || 0));
-      $("#logProgress").style.width = pct + "%";
+      var unknown = Number(data.progress) < 0;
+      var pct = unknown ? 0 : Math.max(0, Math.min(100, Number(data.progress) || 0));
+      $("#logProgress").style.width = unknown ? "" : pct + "%";
+      $("#logProgress").className = unknown ? "progress-bar unknown" : "progress-bar";
       var task = null;
       for (var i = 0; i < state.tasks.length; i++) {
         if (state.tasks[i].id === id) { task = state.tasks[i]; break; }
       }
       $("#logTitle").textContent = task ? taskLabel(task) : "任务日志";
       $("#logSub").textContent = (STATUS_LABEL[data.status] || data.status) +
-        " · " + pct.toFixed(0) + "% · " + id.slice(0, 8);
+        " · " + (unknown ? taskStat(data) : pct.toFixed(0) + "%") + " · " + id.slice(0, 8);
       var cancelBtn = $("#logCancel");
       cancelBtn.hidden = data.status !== "running";
       if (data.status !== "running") {
