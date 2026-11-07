@@ -1123,6 +1123,30 @@ details.adv summary:hover { color: var(--text); }
 .sheet-item:hover { border-color: var(--accent); color: var(--accent-text); }
 .sheet-item svg { width: 20px; height: 20px; flex: 0 0 20px; color: var(--accent-text); }
 
+/* ---------- 设置：FFmpeg / 关于 ---------- */
+
+.settings-more { margin-top: 18px; }
+.radio-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13.5px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.radio-line input { width: 15px; height: 15px; accent-color: var(--accent); }
+.ffmpeg-status { margin-top: 10px; min-height: 20px; line-height: 1.5; }
+.ffmpeg-status.ok { color: var(--text-2); }
+.ffmpeg-status.bad { color: var(--danger, #e5484d); }
+.update-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.update-status { font-size: 12.5px; line-height: 1.5; color: var(--text-2); }
+.update-status.ok { color: var(--accent-text); }
+.update-status.bad { color: var(--danger, #e5484d); }
+.update-status a { color: var(--accent-text); text-decoration: underline; }
+.about-link { color: var(--accent-text); }
+.picker-item.selected { border-color: var(--accent); background: var(--accent-soft); }
+
 /* ---------- 提示条 ---------- */
 
 .toasts {

@@ -36,6 +36,16 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
+APP_VERSION = "1.3.5"
+PROJECT_URL = "https://github.com/qianliaa/video-tool"
+GITHUB_REPO = "qianliaa/video-tool"
+PUBLISHER = "千里"
+DEVELOPER = "千里"
+UPDATE_TTL = 300
+UPDATE_FAIL_TTL = 30
+UPDATE_CACHE = {"at": 0.0, "data": None, "ok": False}
+UPDATE_LOCK = threading.Lock()
+
 PKGVAR = os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.expanduser("~"), ".video-tool")
 CONFIG_PATH = os.path.join(PKGVAR, "config.json")
 AUTH_PATH = os.path.join(PKGVAR, "auth.json")
@@ -61,7 +71,7 @@ URL_MEDIA_EXTS = (".m3u8", ".mpd", ".mp4", ".mkv", ".mov", ".m4v", ".webm",
                   ".wav", ".ogg", ".opus")
 DOWNLOAD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
-               "Chrome/126.0 Safari/537.36 VideoTool/1.3.4")
+               "Chrome/126.0 Safari/537.36 VideoTool/%s" % APP_VERSION)
 MAX_PAGE_BYTES = 2 * 1024 * 1024
 MAX_SCAN_FILES = 5000
 MAX_SCAN_DEPTH = 8
@@ -105,6 +115,11 @@ TASKS_LOCK = threading.Lock()
 
 INPUT_DIR = ""
 OUTPUT_DIR = ""
+FFMPEG_SOURCE = "local"
+FFMPEG_PATH = ""
+FFMPEG_BIN = None
+FFPROBE_BIN = None
+FFMPEG_ERROR = ""
 ROOTS = []
 
 
@@ -112,17 +127,116 @@ ROOTS = []
 # 基础工具
 # --------------------------------------------------------------------------
 
-def find_bin(name):
+def _executable(path):
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def find_system_bin(name, exclude_dir=None):
+    """在系统路径中查找二进制；exclude_dir 用于把应用内置目录排除在外。"""
     path = shutil.which(name)
     if path:
-        return path
-    candidates = [os.path.join(BIN_DIR, name), "/usr/bin/" + name, "/usr/local/bin/" + name]
+        rp = os.path.realpath(os.path.abspath(path))
+        if not exclude_dir or not (rp == exclude_dir or rp.startswith(exclude_dir + os.sep)):
+            return path
+    candidates = ["/usr/bin/" + name, "/usr/local/bin/" + name]
     for app in ("ffmpeg", "ffmpeg7", "ffmpeg6"):
         candidates.append("/var/apps/%s/target/bin/%s" % (app, name))
     for cand in candidates:
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        if _executable(cand):
             return cand
     return None
+
+
+def find_local_bin(name):
+    """本地来源只认应用内置目录：APP_DIR/bin。"""
+    names = [name + ".exe", name] if os.name == "nt" else [name, name + ".exe"]
+    for n in names:
+        cand = os.path.join(BIN_DIR, n)
+        if _executable(cand):
+            return cand
+    return None
+
+
+def find_ffprobe_near(ffmpeg):
+    base = os.path.dirname(os.path.abspath(ffmpeg))
+    names = ["ffprobe.exe", "ffprobe"] if os.name == "nt" else ["ffprobe", "ffprobe.exe"]
+    for n in names:
+        cand = os.path.join(base, n)
+        if _executable(cand):
+            return cand
+    return None
+
+
+def resolve_binaries():
+    """按当前来源解析 ffmpeg/ffprobe，解析结果放在模块全局变量中。"""
+    global FFMPEG_BIN, FFPROBE_BIN, FFMPEG_ERROR
+    FFMPEG_BIN = None
+    FFPROBE_BIN = None
+    FFMPEG_ERROR = ""
+    if FFMPEG_SOURCE == "local":
+        if FFMPEG_PATH:
+            if _executable(FFMPEG_PATH):
+                FFMPEG_BIN = FFMPEG_PATH
+            else:
+                FFMPEG_ERROR = ("本地 ffmpeg 路径不可用：%s（文件不存在或不可执行）。"
+                                "请在设置中重新指定，或切换为「系统原生」。" % FFMPEG_PATH)
+        else:
+            FFMPEG_BIN = find_local_bin("ffmpeg")
+            if not FFMPEG_BIN:
+                FFMPEG_ERROR = ("本地未找到内置 ffmpeg：请将 ffmpeg 可执行文件放到 %s，"
+                                "或在设置中指定 ffmpeg 路径，或切换为「系统原生」。" % BIN_DIR)
+    else:
+        FFMPEG_BIN = find_system_bin("ffmpeg", exclude_dir=BIN_DIR)
+        if not FFMPEG_BIN:
+            FFMPEG_ERROR = "系统原生未找到 ffmpeg，请确认系统已安装 ffmpeg，或切换为「本地」。"
+    if FFMPEG_BIN:
+        FFMPEG_BIN = os.path.abspath(FFMPEG_BIN)
+        FFPROBE_BIN = find_ffprobe_near(FFMPEG_BIN)
+        if not FFPROBE_BIN:
+            if FFMPEG_SOURCE == "local":
+                FFPROBE_BIN = find_local_bin("ffprobe")
+            else:
+                FFPROBE_BIN = find_system_bin("ffprobe", exclude_dir=BIN_DIR)
+        if FFPROBE_BIN:
+            FFPROBE_BIN = os.path.abspath(FFPROBE_BIN)
+    return FFMPEG_BIN
+
+
+def require_ffmpeg():
+    resolve_binaries()
+    if not FFMPEG_BIN:
+        raise ValueError(FFMPEG_ERROR or "未找到可用的 ffmpeg")
+    return FFMPEG_BIN
+
+
+def require_ffprobe():
+    if not FFMPEG_BIN:
+        resolve_binaries()
+    if not FFPROBE_BIN:
+        source = "本地" if FFMPEG_SOURCE == "local" else "系统原生"
+        raise ValueError("未找到 ffprobe（来源：%s），无法读取媒体信息" % source)
+    return FFPROBE_BIN
+
+
+def validate_ffmpeg_path(path):
+    """校验手动指定的本地 ffmpeg 路径，失败时抛出可读的 ValueError。"""
+    if not os.path.isabs(path):
+        raise ValueError("请填写 ffmpeg 可执行文件的完整路径，例如 /vol1/1000/bin/ffmpeg")
+    path = real(path)
+    if not os.path.isfile(path):
+        raise ValueError("ffmpeg 路径不存在或不是文件：%s" % path)
+    if not os.access(path, os.X_OK):
+        raise ValueError("ffmpeg 文件不可执行：%s" % path)
+    try:
+        out = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise ValueError("执行 ffmpeg 超时，请确认该文件是可用的 ffmpeg：%s" % path)
+    except OSError as exc:
+        raise ValueError("无法执行该 ffmpeg：%s" % exc)
+    text = ((out.stdout or "") + (out.stderr or "")).lower()
+    if out.returncode != 0 or "ffmpeg version" not in text:
+        raise ValueError("该文件不是可用的 ffmpeg（未识别到版本信息）：%s" % path)
+    return path
 
 
 FFMPEG_OPTIONS = {}
@@ -241,7 +355,7 @@ def within_roots(path):
 
 
 def load_config():
-    global INPUT_DIR, OUTPUT_DIR, ROOTS
+    global INPUT_DIR, OUTPUT_DIR, FFMPEG_SOURCE, FFMPEG_PATH, ROOTS
     INPUT_DIR = ""
     OUTPUT_DIR = ""
     data = {}
@@ -249,6 +363,8 @@ def load_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
             data = json.load(fp)
     except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     for key, write in (("input_dir", False), ("output_dir", True)):
         value = data.get(key)
@@ -261,21 +377,45 @@ def load_config():
             INPUT_DIR = path
         else:
             OUTPUT_DIR = path
+
+    source = data.get("ffmpeg_source")
+    if isinstance(source, str) and source.strip().lower() in ("local", "system"):
+        FFMPEG_SOURCE = source.strip().lower()
+    else:
+        # 老配置没有来源字段：已经配置过目录的用户迁移为系统原生，避免升级后任务不可用；
+        # 全新安装则按需求默认使用本地。
+        FFMPEG_SOURCE = "system" if (INPUT_DIR or OUTPUT_DIR) else "local"
+    raw_path = data.get("ffmpeg_path")
+    FFMPEG_PATH = raw_path.strip() if isinstance(raw_path, str) else ""
+    if FFMPEG_PATH and not os.path.isabs(FFMPEG_PATH):
+        FFMPEG_PATH = ""
+
     for d in (PKGVAR, LIST_DIR):
         try:
             os.makedirs(d, exist_ok=True)
         except OSError:
             pass
+    resolve_binaries()
     ROOTS = detect_roots()
 
 
 def save_config():
-    data = {"input_dir": INPUT_DIR, "output_dir": OUTPUT_DIR}
+    data = {
+        "input_dir": INPUT_DIR,
+        "output_dir": OUTPUT_DIR,
+        "ffmpeg_source": FFMPEG_SOURCE,
+        "ffmpeg_path": FFMPEG_PATH,
+    }
+    tmp = CONFIG_PATH + ".tmp"
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
+        with open(tmp, "w", encoding="utf-8") as fp:
             json.dump(data, fp, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -624,8 +764,9 @@ def escape_filter_path(path):
 
 
 def probe_duration(path):
-    ffprobe = find_bin("ffprobe")
-    if not ffprobe:
+    try:
+        ffprobe = require_ffprobe()
+    except ValueError:
         return None
     try:
         out = subprocess.run(
@@ -639,9 +780,10 @@ def probe_duration(path):
 
 
 def probe_file(path):
-    ffprobe = find_bin("ffprobe")
-    if not ffprobe:
-        return {"error": "未找到 ffprobe"}
+    try:
+        ffprobe = require_ffprobe()
+    except ValueError as exc:
+        return {"error": str(exc)}
     try:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", path],
@@ -671,14 +813,26 @@ def probe_file(path):
 
 
 def tool_info():
-    info = {"ffmpeg": None, "ffmpeg_dir": None, "ffprobe": None,
-            "ffmpeg_version": None, "downloader": "ffmpeg"}
-    ffmpeg = find_bin("ffmpeg")
-    ffprobe = find_bin("ffprobe")
-    info["ffmpeg"] = ffmpeg
-    info["ffprobe"] = ffprobe
+    resolve_binaries()
+    ffmpeg = FFMPEG_BIN
+    ffprobe = FFPROBE_BIN
+    info = {
+        "ffmpeg": ffmpeg,
+        "ffmpeg_dir": os.path.dirname(ffmpeg) if ffmpeg else None,
+        "ffprobe": ffprobe,
+        "ffmpeg_version": None,
+        "ffmpeg_ready": bool(ffmpeg),
+        "ffmpeg_source": FFMPEG_SOURCE,
+        "ffmpeg_path": FFMPEG_PATH,
+        "ffmpeg_error": FFMPEG_ERROR,
+        "local_dir": BIN_DIR,
+        "downloader": "ffmpeg" if ffmpeg else None,
+        "app_version": APP_VERSION,
+        "publisher": PUBLISHER,
+        "developer": DEVELOPER,
+        "project_url": PROJECT_URL,
+    }
     if ffmpeg:
-        info["ffmpeg_dir"] = os.path.dirname(ffmpeg)
         try:
             out = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, timeout=10)
             info["ffmpeg_version"] = (out.stdout or "").splitlines()[0] if out.stdout else None
@@ -861,9 +1015,7 @@ def ffmpeg_prefix(ffmpeg):
 
 
 def build_ffmpeg(action, p):
-    ffmpeg = find_bin("ffmpeg")
-    if not ffmpeg:
-        raise ValueError("未找到 ffmpeg，请确认系统已安装")
+    ffmpeg = require_ffmpeg()
     prefix = ffmpeg_prefix(ffmpeg)
 
     if action == "merge":
@@ -1265,9 +1417,7 @@ def build_download(p):
     if not re.match(r"^https?://", url, re.I):
         raise ValueError("目前只支持 http/https 地址")
 
-    ffmpeg = find_bin("ffmpeg")
-    if not ffmpeg:
-        raise ValueError("未找到 ffmpeg，无法下载")
+    ffmpeg = require_ffmpeg()
     require_output_dir()
 
     headers = download_headers(p)
@@ -1344,11 +1494,174 @@ def build_download(p):
 
 
 # --------------------------------------------------------------------------
+# 检查更新
+# --------------------------------------------------------------------------
+
+def version_key(text):
+    text = str(text or "").strip().lower()
+    if text.startswith("v"):
+        text = text[1:]
+    m = re.match(r"^(\d+(?:\.\d+)*)", text)
+    if not m:
+        return ()
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def version_compare(a, b):
+    ka, kb = version_key(a), version_key(b)
+    width = max(len(ka), len(kb))
+    ka = ka + (0,) * (width - len(ka))
+    kb = kb + (0,) * (width - len(kb))
+    return (ka > kb) - (ka < kb)
+
+
+def update_api_url():
+    override = os.environ.get("VT_GITHUB_API", "").strip()
+    if override:
+        return override
+    return "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+
+
+def fetch_latest_release():
+    """请求 GitHub Releases；任何失败都转换成可读信息，不抛异常。"""
+    req = urllib.request.Request(update_api_url(), headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "VideoTool/%s" % APP_VERSION,
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    token = os.environ.get("VT_GITHUB_TOKEN", "").strip()
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        headers = exc.headers or {}
+        remain = str(headers.get("X-RateLimit-Remaining") or "").strip()
+        reset = str(headers.get("X-RateLimit-Reset") or "").strip()
+        retry_after = str(headers.get("Retry-After") or "").strip()
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        limited = (exc.code == 429 or remain == "0"
+                   or "rate limit" in body.lower() or "api rate" in body.lower())
+        if exc.code in (403, 429) and limited:
+            msg = "GitHub API 速率限制（未登录时每小时 60 次）。"
+            wait = ""
+            if retry_after.isdigit():
+                wait = "%d 秒后" % int(retry_after)
+            elif reset.isdigit():
+                try:
+                    wait = "%s 后" % time.strftime("%H:%M", time.localtime(int(reset)))
+                except (ValueError, OSError):
+                    wait = ""
+            if wait:
+                msg += "预计 %s可重试。" % wait
+            msg += "也可配置环境变量 VT_GITHUB_TOKEN 提升限额。"
+            return {"ok": False, "status": "error", "code": "rate_limit", "message": msg}
+        if exc.code == 404:
+            return {"ok": False, "status": "error", "code": "not_found",
+                    "message": "仓库暂无 Release 记录，或仓库不可公开访问。"}
+        return {"ok": False, "status": "error", "code": "http_error",
+                "message": "GitHub 返回 HTTP %d，请稍后重试。" % exc.code}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, TimeoutError):
+            reason = "连接超时"
+        reason = str(reason).strip().rstrip("。.")
+        return {"ok": False, "status": "error", "code": "network",
+                "message": "网络请求失败：%s。请检查飞牛的网络或代理设置后重试。" % reason}
+    except Exception as exc:
+        return {"ok": False, "status": "error", "code": "network",
+                "message": "网络请求失败：%s" % exc}
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {"ok": False, "status": "error", "code": "bad_json",
+                "message": "GitHub 返回数据无法解析，请稍后重试。"}
+    if not isinstance(data, dict):
+        return {"ok": False, "status": "error", "code": "bad_json",
+                "message": "GitHub 返回数据格式异常，请稍后重试。"}
+
+    tag = str(data.get("tag_name") or data.get("name") or "").strip()
+    latest = tag[1:] if tag.lower().startswith("v") else tag
+    if not version_key(latest):
+        return {"ok": False, "status": "error", "code": "bad_version",
+                "message": "GitHub Release 的版本号无法识别：%s" % (tag or "（空）")}
+
+    release_url = data.get("html_url") or (PROJECT_URL + "/releases")
+    asset = None
+    for item in (data.get("assets") or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not name.lower().endswith(".fpk"):
+            continue
+        if asset is None:
+            asset = item
+        if name.lower().startswith("video-tool-%s." % latest.lower()):
+            asset = item
+            break
+    download_url = release_url
+    asset_name = ""
+    asset_size = 0
+    if asset:
+        download_url = asset.get("browser_download_url") or release_url
+        asset_name = str(asset.get("name") or "")
+        try:
+            asset_size = int(asset.get("size") or 0)
+        except (TypeError, ValueError):
+            asset_size = 0
+
+    notes = data.get("body")
+    notes = notes.strip() if isinstance(notes, str) else ""
+    if len(notes) > 600:
+        notes = notes[:600] + "…"
+
+    return {
+        "ok": True,
+        "status": "latest" if version_compare(APP_VERSION, latest) >= 0 else "update",
+        "current": APP_VERSION,
+        "latest": latest,
+        "tag": tag,
+        "download_url": download_url,
+        "asset_name": asset_name,
+        "size": asset_size,
+        "published_at": data.get("published_at") or "",
+        "notes": notes,
+    }
+
+
+def check_update(force=False):
+    now = time.time()
+    with UPDATE_LOCK:
+        cached = UPDATE_CACHE.get("data")
+        if cached is not None and not force:
+            ttl = UPDATE_TTL if UPDATE_CACHE.get("ok") else UPDATE_FAIL_TTL
+            if now - UPDATE_CACHE.get("at", 0.0) < ttl:
+                result = dict(cached)
+                result["cached"] = True
+                return result
+    result = fetch_latest_release()
+    result.setdefault("current", APP_VERSION)
+    result["checked_at"] = int(now)
+    result["cached"] = False
+    with UPDATE_LOCK:
+        UPDATE_CACHE["at"] = now
+        UPDATE_CACHE["data"] = result
+        UPDATE_CACHE["ok"] = bool(result.get("ok"))
+    return result
+
+
+# --------------------------------------------------------------------------
 # HTTP 处理
 # --------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoTool/1.3.4"
+    server_version = "VideoTool/%s" % APP_VERSION
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -1465,6 +1778,8 @@ class Handler(BaseHTTPRequestHandler):
                     "auth_file": AUTH_PATH,
                 })
                 self.send_json(info)
+            elif path == "/api/update":
+                self.api_update()
             elif path == "/api/browse":
                 self.api_browse()
             elif path == "/api/files":
@@ -1495,6 +1810,7 @@ class Handler(BaseHTTPRequestHandler):
     def api_config(self):
         input_ok, input_error = dir_state(INPUT_DIR, False)
         output_ok, output_error = dir_state(OUTPUT_DIR, True)
+        resolve_binaries()
         self.send_json({
             "input_dir": INPUT_DIR,
             "output_dir": OUTPUT_DIR,
@@ -1505,7 +1821,19 @@ class Handler(BaseHTTPRequestHandler):
             "configured": input_ok and output_ok,
             "roots": ROOTS,
             "pkgvar": PKGVAR,
+            "ffmpeg_source": FFMPEG_SOURCE,
+            "ffmpeg_path": FFMPEG_PATH,
+            "ffmpeg": FFMPEG_BIN,
+            "ffprobe": FFPROBE_BIN,
+            "ffmpeg_ready": bool(FFMPEG_BIN),
+            "ffmpeg_error": FFMPEG_ERROR,
+            "local_dir": BIN_DIR,
         })
+
+    def api_update(self):
+        q = self.query()
+        force = str(q.get("refresh", "")).lower() in ("1", "true", "yes")
+        self.send_json(check_update(force))
 
     def api_browse(self):
         q = self.query()
@@ -1514,6 +1842,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "缺少 path"}, 400)
             return
         path = real(path)
+        selected = ""
+        if os.path.isfile(path):
+            selected = os.path.basename(path)
+            path = os.path.dirname(path)
         if is_app_dir(path):
             self.send_json({"error": "不能浏览应用自身目录"}, 403)
             return
@@ -1522,7 +1854,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         add_root(path)
 
+        want_files = str(q.get("files", "")).lower() in ("1", "true", "yes")
         dirs = []
+        files = []
         error = ""
         readable = True
         skip_dirs = {"#recycle", "@eadir", "$recycle.bin", "lost+found",
@@ -1533,15 +1867,24 @@ class Handler(BaseHTTPRequestHandler):
                     if entry.name.startswith(".") or entry.name.lower() in skip_dirs:
                         continue
                     try:
-                        if not entry.is_dir():
-                            continue
-                        if is_app_dir(entry.path):
-                            continue
-                        dirs.append({
-                            "name": entry.name,
-                            "path": entry.path,
-                            "writable": os.access(entry.path, os.W_OK),
-                        })
+                        if entry.is_dir():
+                            if is_app_dir(entry.path):
+                                continue
+                            dirs.append({
+                                "name": entry.name,
+                                "path": entry.path,
+                                "writable": os.access(entry.path, os.W_OK),
+                            })
+                        elif want_files and entry.is_file():
+                            st = entry.stat()
+                            files.append({
+                                "name": entry.name,
+                                "path": entry.path,
+                                "size": st.st_size,
+                                "exec": os.access(entry.path, os.X_OK),
+                            })
+                            if len(files) >= 2000:
+                                break
                     except OSError:
                         continue
         except PermissionError:
@@ -1552,6 +1895,7 @@ class Handler(BaseHTTPRequestHandler):
             error = "读取目录失败：%s" % exc
 
         dirs.sort(key=lambda x: x["name"].lower())
+        files.sort(key=lambda x: x["name"].lower())
         parent = os.path.dirname(path)
         if parent == path or is_app_dir(parent):
             parent = None
@@ -1560,6 +1904,8 @@ class Handler(BaseHTTPRequestHandler):
             "parent": parent,
             "roots": ROOTS,
             "dirs": dirs,
+            "files": files,
+            "selected": selected,
             "readable": readable,
             "writable": os.access(path, os.W_OK),
             "error": error,
@@ -1778,7 +2124,7 @@ class Handler(BaseHTTPRequestHandler):
                                        % SESSION_COOKIE)])
 
     def api_save_config(self):
-        global INPUT_DIR, OUTPUT_DIR
+        global INPUT_DIR, OUTPUT_DIR, FFMPEG_SOURCE, FFMPEG_PATH
         data = self.read_json()
         new_input = data.get("input_dir") if "input_dir" in data else INPUT_DIR
         new_output = data.get("output_dir") if "output_dir" in data else OUTPUT_DIR
@@ -1809,11 +2155,27 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 raise ValueError("输出目录不可用：%s" % err)
 
+        new_source = data.get("ffmpeg_source") if "ffmpeg_source" in data else FFMPEG_SOURCE
+        new_source = (new_source or "").strip().lower()
+        if new_source not in ("local", "system"):
+            raise ValueError("FFmpeg 来源不合法，只支持 local（本地）或 system（系统原生）")
+        new_path = data.get("ffmpeg_path") if "ffmpeg_path" in data else FFMPEG_PATH
+        new_path = (new_path or "").strip()
+        if len(new_path) > 4096:
+            raise ValueError("ffmpeg 路径过长")
+        if new_source == "local" and new_path:
+            new_path = validate_ffmpeg_path(new_path)
+        elif not new_path:
+            new_path = ""
+
         INPUT_DIR = new_input
         OUTPUT_DIR = new_output
+        FFMPEG_SOURCE = new_source
+        FFMPEG_PATH = new_path
         for p in (INPUT_DIR, OUTPUT_DIR):
             if p:
                 add_root(p)
+        resolve_binaries()
         save_config()
 
         input_ok, input_error = dir_state(INPUT_DIR, False)
@@ -1827,6 +2189,13 @@ class Handler(BaseHTTPRequestHandler):
             "output_ok": output_ok,
             "output_error": output_error,
             "roots": ROOTS,
+            "ffmpeg_source": FFMPEG_SOURCE,
+            "ffmpeg_path": FFMPEG_PATH,
+            "ffmpeg": FFMPEG_BIN,
+            "ffprobe": FFPROBE_BIN,
+            "ffmpeg_ready": bool(FFMPEG_BIN),
+            "ffmpeg_error": FFMPEG_ERROR,
+            "local_dir": BIN_DIR,
         })
 
     def api_checkdir(self):
@@ -1953,6 +2322,7 @@ def main():
     print("serving on %s:%d" % (args.host, args.port))
     print("input:  %s" % INPUT_DIR)
     print("output: %s" % OUTPUT_DIR)
+    print("ffmpeg: %s (%s)" % (FFMPEG_BIN or ("未就绪：" + FFMPEG_ERROR), FFMPEG_SOURCE))
     print("roots:  %s" % ", ".join(ROOTS))
     print("auth:   %s (%s)" % ("enabled" if auth_configured() else "setup required", AUTH_PATH))
     try:

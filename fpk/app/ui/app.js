@@ -6,7 +6,12 @@
   var $$ = function (sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); };
 
   var state = {
-    config: { input_dir: "", output_dir: "", input_ok: true, output_ok: true, input_error: "", output_error: "" },
+    config: {
+      input_dir: "", output_dir: "",
+      input_ok: true, output_ok: true, input_error: "", output_error: "",
+      ffmpeg_source: "local", ffmpeg_path: "", ffmpeg: "", ffmpeg_ready: false,
+      ffmpeg_error: "", local_dir: ""
+    },
     roots: [],
     tools: {},
     files: [],
@@ -23,6 +28,7 @@
     logId: null,
     logTimer: null,
     taskTimer: null,
+    updateBusy: false,
     auth: { configured: false, authenticated: false, setup: false, busy: false }
   };
 
@@ -387,16 +393,53 @@
     updatePreviews();
   }
 
+  function applyConfig(cfg) {
+    cfg = cfg || {};
+    state.config.input_dir = cfg.input_dir || "";
+    state.config.output_dir = cfg.output_dir || "";
+    state.config.input_ok = cfg.input_ok !== false;
+    state.config.output_ok = cfg.output_ok !== false;
+    state.config.input_error = cfg.input_error || "";
+    state.config.output_error = cfg.output_error || "";
+    state.config.ffmpeg_source = cfg.ffmpeg_source === "system" ? "system" : "local";
+    state.config.ffmpeg_path = cfg.ffmpeg_path || "";
+    state.config.ffmpeg = cfg.ffmpeg || "";
+    state.config.ffmpeg_ready = !!cfg.ffmpeg_ready;
+    state.config.ffmpeg_error = cfg.ffmpeg_error || "";
+    if (cfg.local_dir) state.config.local_dir = cfg.local_dir;
+    state.roots = cfg.roots || state.roots;
+  }
+
+  function renderFfmpeg() {
+    var cfg = state.config;
+    var local = $("#ffLocal");
+    var system = $("#ffSystem");
+    if (local) local.checked = cfg.ffmpeg_source === "local";
+    if (system) system.checked = cfg.ffmpeg_source === "system";
+    var pathEl = $("#setFfmpegPath");
+    if (pathEl && document.activeElement !== pathEl) pathEl.value = cfg.ffmpeg_path || "";
+    var field = $("#ffPathField");
+    if (field) field.hidden = cfg.ffmpeg_source !== "local";
+    if ($("#ffLocalDir")) $("#ffLocalDir").textContent = cfg.local_dir || "bin";
+    var status = $("#ffStatus");
+    if (status) {
+      if (cfg.ffmpeg_ready) {
+        status.className = "hint ffmpeg-status ok";
+        status.textContent = "已就绪：" + (cfg.ffmpeg || "已找到 ffmpeg");
+        status.title = cfg.ffmpeg || "";
+      } else {
+        status.className = "hint ffmpeg-status bad";
+        status.textContent = cfg.ffmpeg_error || "ffmpeg 未就绪";
+        status.title = status.textContent;
+      }
+    }
+  }
+
   function loadConfig() {
     return api("/api/config").then(function (cfg) {
-      state.config.input_dir = cfg.input_dir || "";
-      state.config.output_dir = cfg.output_dir || "";
-      state.config.input_ok = cfg.input_ok !== false;
-      state.config.output_ok = cfg.output_ok !== false;
-      state.config.input_error = cfg.input_error || "";
-      state.config.output_error = cfg.output_error || "";
-      state.roots = cfg.roots || [];
+      applyConfig(cfg);
       renderDirs();
+      renderFfmpeg();
       return cfg;
     });
   }
@@ -406,6 +449,7 @@
       state.tools = info || {};
       renderTools();
       renderToolInfo();
+      renderAbout();
       return info;
     }).catch(function (err) {
       if (!err || !err.unauthorized) toast("读取环境信息失败：" + err.message, "error");
@@ -422,8 +466,8 @@
       ff.title = t.ffmpeg_version || t.ffmpeg;
     } else {
       ff.className = "chip bad";
-      ff.innerHTML = '<i class="dot"></i>ffmpeg 未安装';
-      ff.title = "未找到 ffmpeg";
+      ff.innerHTML = '<i class="dot"></i>ffmpeg 未就绪';
+      ff.title = t.ffmpeg_error || "未找到 ffmpeg";
     }
   }
 
@@ -434,8 +478,9 @@
     var ffmpegVer = t.ffmpeg_version || "";
     var m = ffmpegVer.match(/version\s+(\S+)/i);
     var rows = [
-      ["ffmpeg", m ? "v" + m[1] : (ffmpegVer || "未找到"), ffmpegVer],
-      ["ffmpeg 目录", t.ffmpeg_dir || "-"],
+      ["ffmpeg", m ? "v" + m[1] : (ffmpegVer || "未就绪"), ffmpegVer],
+      ["ffmpeg 来源", t.ffmpeg_source === "system" ? "系统原生" : "本地", ""],
+      ["ffmpeg 路径", t.ffmpeg || (t.ffmpeg_error ? "未就绪" : "-"), t.ffmpeg || t.ffmpeg_error || ""],
       ["下载引擎", t.downloader === "ffmpeg" ? "ffmpeg 原生" : "未就绪"],
       ["访问控制", t.auth_enabled ? "已启用" : "未设置", t.auth_file || ""],
       ["配置目录", t.pkgvar || "-"]
@@ -444,6 +489,79 @@
       return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[2] || r[1]) + '">' + esc(r[1]) + '</span></div>';
     }).join("");
     if ($("#authFilePath")) $("#authFilePath").textContent = t.auth_file || "auth.json";
+  }
+
+  function renderAbout() {
+    var t = state.tools || {};
+    var box = $("#aboutInfo");
+    if (!box) return;
+    var rows = [
+      ["应用版本", t.app_version || "-"],
+      ["发布者", t.publisher || "-"],
+      ["开发者", t.developer || "-"]
+    ];
+    box.innerHTML = rows.map(function (r) {
+      return '<div><span>' + esc(r[0]) + '</span><span>' + esc(r[1]) + '</span></div>';
+    }).join("");
+    var linkRow = document.createElement("div");
+    linkRow.innerHTML = '<span>项目主页</span><span><a class="about-link" href="' +
+      esc(t.project_url || "https://github.com/qianliaa/video-tool") +
+      '" target="_blank" rel="noopener noreferrer">github.com/qianliaa/video-tool</a></span>';
+    box.appendChild(linkRow);
+    if ($("#aboutPublisher")) $("#aboutPublisher").textContent = t.publisher || "千里";
+    if ($("#aboutDeveloper")) $("#aboutDeveloper").textContent = t.developer || "千里";
+  }
+
+  // ---------------------------------------------------------------- 检查更新
+
+  function renderUpdate(result) {
+    var box = $("#updateStatus");
+    if (!box) return;
+    if (!result) {
+      box.className = "update-status";
+      box.textContent = "尚未检查";
+      return;
+    }
+    if (!result.ok) {
+      box.className = "update-status bad";
+      box.textContent = (result.message || "检查更新失败") + "（可稍后重试）";
+      return;
+    }
+    var current = result.current || "-";
+    if (result.status === "latest") {
+      box.className = "update-status ok";
+      box.textContent = "当前版本 " + current + " 已是最新版本（GitHub 最新 " + (result.latest || "-") + "）";
+      return;
+    }
+    box.className = "update-status ok";
+    box.innerHTML = "发现新版本 " + esc(result.latest || "-") + "（当前 " + esc(current) + "），" +
+      '<a href="' + esc(result.download_url || "#") + '" target="_blank" rel="noopener noreferrer">下载 ' +
+      esc(result.asset_name || "Release") + "</a>";
+  }
+
+  function checkUpdate() {
+    if (state.updateBusy) return;
+    state.updateBusy = true;
+    var btn = $("#checkUpdate");
+    if (btn) btn.disabled = true;
+    var box = $("#updateStatus");
+    if (box) {
+      box.className = "update-status";
+      box.textContent = "正在查询 GitHub Releases…";
+    }
+    api("/api/update?refresh=1").then(function (result) {
+      renderUpdate(result);
+    }).catch(function (err) {
+      if (err && err.unauthorized) return;
+      var tip = $("#updateStatus");
+      if (tip) {
+        tip.className = "update-status bad";
+        tip.textContent = "检查更新失败：" + err.message;
+      }
+    }).then(function () {
+      state.updateBusy = false;
+      if (btn) btn.disabled = false;
+    });
   }
 
   // ---------------------------------------------------------------- 文件列表
@@ -839,10 +957,15 @@
 
   function openPicker(mode) {
     state.picker.mode = mode;
-    $("#pickerTitle").textContent = mode === "output" ? "选择输出目录" : "选择输入目录";
+    var titles = { input: "选择输入目录", output: "选择输出目录", ffmpeg: "选择 ffmpeg 可执行文件" };
+    $("#pickerTitle").textContent = titles[mode] || "选择目录";
     $("#pickerModal").hidden = false;
     $("#pickerNewName").value = "";
-    var start = mode === "output" ? state.config.output_dir : state.config.input_dir;
+    if ($("#pickerNew")) $("#pickerNew").hidden = mode === "ffmpeg";
+    if ($("#pickerChoose")) $("#pickerChoose").hidden = mode === "ffmpeg";
+    var start = mode === "output" ? state.config.output_dir
+      : mode === "ffmpeg" ? (state.config.ffmpeg_path || "")
+      : state.config.input_dir;
     $("#pickerPathInput").value = start || "";
     browseTo(start || "/");
   }
@@ -852,8 +975,10 @@
       $("#pickerList").innerHTML = '<div class="picker-empty">没有可浏览的目录</div>';
       return;
     }
+    var mode = state.picker.mode;
+    var url = "/api/browse?path=" + encodeURIComponent(path) + (mode === "ffmpeg" ? "&files=1" : "");
     $("#pickerList").innerHTML = '<div class="picker-empty">加载中…</div>';
-    api("/api/browse?path=" + encodeURIComponent(path)).then(function (data) {
+    api(url).then(function (data) {
       state.picker.path = data.path;
       state.picker.parent = data.parent;
       state.roots = data.roots || state.roots;
@@ -873,10 +998,29 @@
         btn.addEventListener("click", function () { browseTo(dir.path); });
         box.appendChild(btn);
       });
+      if (mode === "ffmpeg") {
+        (data.files || []).forEach(function (file) {
+          var btn = document.createElement("button");
+          btn.className = "picker-item" + (data.selected === file.name ? " selected" : "");
+          btn.title = file.path;
+          btn.innerHTML =
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' +
+            '<span>' + esc(file.name) + '</span>' +
+            (file.exec ? "" : '<span class="lock">不可执行</span>');
+          btn.addEventListener("click", function () {
+            var input = $("#setFfmpegPath");
+            if (input) input.value = file.path;
+            $("#pickerModal").hidden = true;
+            toast("已选择 ffmpeg 路径，点击「保存 FFmpeg 设置」后生效", "success");
+          });
+          box.appendChild(btn);
+        });
+      }
       if (data.error) {
         box.innerHTML = '<div class="picker-empty">' + esc(data.error) + '</div>';
-      } else if (!(data.dirs || []).length) {
-        box.innerHTML = '<div class="picker-empty">该目录下没有子文件夹</div>';
+      } else if (!(data.dirs || []).length && !(data.files || []).length) {
+        box.innerHTML = '<div class="picker-empty">' +
+          (mode === "ffmpeg" ? "该目录下没有文件或子文件夹" : "该目录下没有子文件夹") + '</div>';
       }
     }).catch(function (err) {
       $("#pickerList").innerHTML = '<div class="picker-empty">' + esc(err.message) + '</div>';
@@ -886,7 +1030,11 @@
 
   function gotoPickerPath() {
     var raw = ($("#pickerPathInput").value || "").trim();
-    if (!raw) { toast("请填写目录路径", "error"); return; }
+    if (!raw) { toast("请填写路径", "error"); return; }
+    if (state.picker.mode === "ffmpeg") {
+      browseTo(raw);
+      return;
+    }
     post("/api/checkdir", { path: raw, purpose: state.picker.mode }).then(function (data) {
       state.roots = data.roots || state.roots;
       browseTo(data.path);
@@ -909,6 +1057,7 @@
   }
 
   function choosePickerDir() {
+    if (state.picker.mode === "ffmpeg") return;
     var path = state.picker.path;
     if (!path) return;
     var payload = {
@@ -919,15 +1068,10 @@
     else payload.input_dir = path;
 
     post("/api/config", payload).then(function (data) {
-      state.config.input_dir = data.input_dir || "";
-      state.config.output_dir = data.output_dir || "";
-      state.config.input_ok = data.input_ok !== false;
-      state.config.output_ok = data.output_ok !== false;
-      state.config.input_error = data.input_error || "";
-      state.config.output_error = data.output_error || "";
-      state.roots = data.roots || state.roots;
+      applyConfig(data);
       $("#pickerModal").hidden = true;
       renderDirs();
+      renderFfmpeg();
       toast(state.picker.mode === "output" ? "输出目录已更新" : "输入目录已更新", "success");
       loadFiles();
     }).catch(function (err) {
@@ -1225,18 +1369,55 @@
         input_dir: ($("#setInput").value || "").trim(),
         output_dir: ($("#setOutput").value || "").trim()
       }).then(function (data) {
-        state.config.input_dir = data.input_dir || "";
-        state.config.output_dir = data.output_dir || "";
-        state.config.input_ok = data.input_ok !== false;
-        state.config.output_ok = data.output_ok !== false;
-        state.config.input_error = data.input_error || "";
-        state.config.output_error = data.output_error || "";
-        state.roots = data.roots || state.roots;
+        applyConfig(data);
         renderDirs();
+        renderFfmpeg();
         toast("目录设置已保存", "success");
         loadFiles();
       }).catch(function (err) { toast(err.message, "error", 6000); });
     });
+  }
+
+  function saveFfmpeg(showToast) {
+    var source = $("#ffSystem") && $("#ffSystem").checked ? "system" : "local";
+    var pathValue = $("#setFfmpegPath") ? ($("#setFfmpegPath").value || "").trim() : "";
+    var btn = $("#ffSave");
+    if (btn) btn.disabled = true;
+    return post("/api/config", {
+      ffmpeg_source: source,
+      ffmpeg_path: pathValue
+    }).then(function (data) {
+      applyConfig(data);
+      renderFfmpeg();
+      loadTools();
+      if (showToast) {
+        if (state.config.ffmpeg_ready) toast("FFmpeg 设置已保存", "success");
+        else toast("FFmpeg 设置已保存，但当前来源不可用，请查看提示", "error", 6000);
+      }
+    }).catch(function (err) {
+      if (err && err.unauthorized) return;
+      toast(err.message, "error", 7000);
+      var status = $("#ffStatus");
+      if (status) {
+        status.className = "hint ffmpeg-status bad";
+        status.textContent = err.message;
+      }
+    }).then(function () {
+      if (btn) btn.disabled = false;
+    });
+  }
+
+  function bindFfmpeg() {
+    if ($("#ffSave")) {
+      $("#ffSave").addEventListener("click", function () { saveFfmpeg(true); });
+    }
+    $$('input[name="ffmpegSource"]').forEach(function (radio) {
+      radio.addEventListener("change", function () {
+        renderFfmpeg();
+        saveFfmpeg(false);
+      });
+    });
+    if ($("#checkUpdate")) $("#checkUpdate").addEventListener("click", checkUpdate);
   }
 
   function bindPicker() {
@@ -1324,6 +1505,7 @@
     bindAdvanced();
     bindTasks();
     bindSettings();
+    bindFfmpeg();
     bindPicker();
     bindLog();
     bindAuth();
