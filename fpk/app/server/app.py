@@ -34,7 +34,7 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -123,6 +123,9 @@ SESSIONS = {}
 SESSIONS_LOCK = threading.RLock()
 LOGIN_FAILS = {}
 LOGIN_FAILS_LOCK = threading.Lock()
+
+ALLOW_REGISTER = True
+REGISTER_APPROVAL = False
 
 
 # --------------------------------------------------------------------------
@@ -308,8 +311,22 @@ def within_roots(path):
     return False
 
 
+def _as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def load_config():
-    global INPUT_DIR, OUTPUT_DIR, ROOTS
+    global INPUT_DIR, OUTPUT_DIR, ROOTS, ALLOW_REGISTER, REGISTER_APPROVAL
     INPUT_DIR = ""
     OUTPUT_DIR = ""
     data = {}
@@ -320,6 +337,8 @@ def load_config():
         data = {}
     if not isinstance(data, dict):
         data = {}
+    ALLOW_REGISTER = _as_bool(data.get("allow_register"), True)
+    REGISTER_APPROVAL = _as_bool(data.get("register_approval"), False)
     for key, write in (("input_dir", False), ("output_dir", True)):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -345,6 +364,8 @@ def save_config():
     data = {
         "input_dir": INPUT_DIR,
         "output_dir": OUTPUT_DIR,
+        "allow_register": bool(ALLOW_REGISTER),
+        "register_approval": bool(REGISTER_APPROVAL),
     }
     tmp = CONFIG_PATH + ".tmp"
     try:
@@ -362,11 +383,72 @@ def save_config():
 # 账号与会话
 # --------------------------------------------------------------------------
 
-# fnOS（飞牛）第三方应用目前只能拿到 TRIM_APPDEST / TRIM_PKGVAR 等路径类环境变量，
-# 官方文档未提供“当前登录的飞牛账号”注入方式，应用网关也不下发用户身份请求头。
-# 因此不猜测主账号身份：应用内首次设置的管理员就是最高权限账号。
-FNOS_IDENTITY_SOURCE = "app-admin"
-FNOS_IDENTITY_NOTE = "fnOS 未向第三方应用提供当前登录账号（无相关环境变量或请求头），应用内管理员为最高权限"
+# 飞牛 fnOS 身份通道（依据官方开发者文档与官方 Web API 文档）：
+# * 端口服务入口（app/ui/config 中的 protocol + port）与 NAS 登录态无关，不会携带用户身份；
+# * 统一网关入口（gatewayPrefix + gatewaySocket，Unix Socket）会先校验登录态，再注入
+#   X-Trim-Userid / X-Trim-Username / X-Trim-Isadmin 请求头；
+# * index.cgi 入口会校验登录态，但官方文档未承诺向 CGI 下发用户字段；
+# * 面板自身的用户管理 WebSocket API 需要 NAS 管理员 Token + 签名，第三方应用无法调用。
+# 本项目仍以端口服务分发，默认拿不到飞牛账号。探测层保留可复用读取逻辑：
+# 显式环境变量 VT_FNOS_USER / VT_FNOS_USERNAME（可配 VT_FNOS_ISADMIN），
+# 或来自本机回环代理的网关请求头。为防止公网直连伪造请求头，X-Trim-* 等身份头
+# 只在请求来源为本机回环、或显式设置 VT_FNOS_TRUST_HEADERS=1 时才被信任。
+FNOS_IDENTITY_NOTE_FALLBACK = (
+    "未能从飞牛 fnOS 获取当前登录账号：本应用使用端口服务入口，官方文档说明端口服务"
+    "与 NAS 登录态无关，不会下发 X-Trim-Userid / X-Trim-Username / X-Trim-Isadmin 等身份头；"
+    "因此按「首个完成注册的账号为主账号管理员」处理，其余注册账号为普通用户。"
+)
+LOOPBACK_ADDRS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+FNOS_USER_ENV_KEYS = ("VT_FNOS_USER", "VT_FNOS_USERNAME", "FNOS_USERNAME")
+
+
+def _trust_proxy_headers():
+    return os.environ.get("VT_FNOS_TRUST_HEADERS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _identity_from_headers(handler):
+    """只在本机回环代理或显式信任时才读取网关身份头，避免公网伪造。"""
+    if handler is None:
+        return None
+    if not _trust_proxy_headers():
+        peer = handler.client_address[0] if handler.client_address else ""
+        if peer not in LOOPBACK_ADDRS:
+            return None
+    trim_user = (handler.headers.get("X-Trim-Username") or "").strip()
+    if trim_user:
+        uid = (handler.headers.get("X-Trim-Userid") or "").strip()
+        is_admin = (handler.headers.get("X-Trim-Isadmin") or "").strip().lower() in (
+            "1", "true", "yes")
+        return {"username": trim_user, "uid": uid, "is_admin": is_admin,
+                "source": "fnos-gateway-header", "detail": "X-Trim-Username/X-Trim-Userid/X-Trim-Isadmin"}
+    proxy_user = ((handler.headers.get("X-Forwarded-User") or "").strip()
+                  or (handler.headers.get("Remote-User") or "").strip())
+    if proxy_user:
+        return {"username": proxy_user, "uid": "", "is_admin": False,
+                "source": "trusted-proxy-header", "detail": "X-Forwarded-User/Remote-User"}
+    return None
+
+
+def detect_fnos_identity(handler=None):
+    """可复用的飞牛身份探测层：显式配置 > 本机可信代理请求头；无法确认时返回 None。"""
+    for key in FNOS_USER_ENV_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        if not value:
+            continue
+        is_admin = os.environ.get("VT_FNOS_ISADMIN", "1").strip().lower() in (
+            "1", "true", "yes", "on")
+        return {"username": value, "uid": "", "is_admin": is_admin,
+                "source": "env:" + key, "detail": "显式环境变量"}
+    return _identity_from_headers(handler)
+
+
+def identity_note(identity):
+    if identity:
+        role = "管理员" if identity.get("is_admin") else "普通用户"
+        return "已识别飞牛账号 %s（%s，来源：%s）" % (
+            identity.get("username"), role, identity.get("source"))
+    return FNOS_IDENTITY_NOTE_FALLBACK
 
 
 def _atomic_write_json(path, data):
@@ -423,13 +505,25 @@ def normalize_username(value):
     return name.lower()
 
 
-def check_password_value(password):
+def check_password_value(password, username=""):
     if not isinstance(password, str):
         password = ""
     if len(password) < PASSWORD_MIN:
         raise ValueError("密码至少需要 %d 个字符" % PASSWORD_MIN)
     if len(password) > PASSWORD_MAX:
         raise ValueError("密码不能超过 %d 个字符" % PASSWORD_MAX)
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"[0-9]", password):
+        raise ValueError("密码需同时包含字母和数字")
+    if username and password.strip().lower() == (username or "").strip().lower():
+        raise ValueError("密码不能与账号名相同")
+    return password
+
+
+def check_confirm(password, confirm, required=True):
+    if confirm is None and not required:
+        return password
+    if not isinstance(confirm, str) or confirm != password:
+        raise ValueError("两次输入的密码不一致")
     return password
 
 
@@ -465,6 +559,11 @@ def load_users():
             "username": name,
             "role": "admin" if item.get("role") == "admin" else "user",
             "enabled": bool(item.get("enabled", True)),
+            "approved": bool(item.get("approved", True)),
+            "primary": bool(item.get("primary", False)),
+            "created_via": str(item.get("created_via") or "admin"),
+            "fnos_uid": str(item.get("fnos_uid") or ""),
+            "fnos_username": str(item.get("fnos_username") or ""),
             "algo": "scrypt",
             "n": int(item.get("n") or 16384),
             "r": int(item.get("r") or 8),
@@ -474,6 +573,10 @@ def load_users():
             "created": int(item.get("created") or 0),
             "updated": int(item.get("updated") or 0),
         })
+    if any(u["role"] == "admin" for u in users) and not any(u["primary"] for u in users):
+        admins = sorted([u for u in users if u["role"] == "admin"],
+                        key=lambda u: u["created"] or 0)
+        admins[0]["primary"] = True
     with USERS_LOCK:
         USERS = users
 
@@ -504,9 +607,32 @@ def admin_count():
         return sum(1 for u in USERS if u.get("role") == "admin")
 
 
-def create_user(name, password, role="user", enabled=True):
+def primary_user():
+    with USERS_LOCK:
+        for user in USERS:
+            if user.get("primary"):
+                return dict(user)
+    return None
+
+
+def fnos_bound_user(uid, name):
+    uid = (uid or "").strip()
+    name = (name or "").strip().lower()
+    if not uid and not name:
+        return None
+    with USERS_LOCK:
+        for user in USERS:
+            if uid and user.get("fnos_uid") == uid:
+                return dict(user)
+            if name and (user.get("fnos_username") or "").lower() == name:
+                return dict(user)
+    return None
+
+
+def create_user(name, password, role="user", enabled=True, approved=True, primary=False,
+                created_via="admin", fnos_uid="", fnos_username=""):
     username = normalize_username(name)
-    password = check_password_value(password)
+    password = check_password_value(password, username)
     with USERS_LOCK:
         if any(u["username"] == username for u in USERS):
             raise ValueError("账号已存在：%s" % username)
@@ -514,6 +640,11 @@ def create_user(name, password, role="user", enabled=True):
         user = {"username": username,
                 "role": "admin" if role == "admin" else "user",
                 "enabled": bool(enabled),
+                "approved": bool(approved),
+                "primary": bool(primary),
+                "created_via": created_via if created_via in ("setup", "register", "admin") else "admin",
+                "fnos_uid": (fnos_uid or "").strip(),
+                "fnos_username": (fnos_username or "").strip(),
                 "created": now, "updated": now}
         user.update(_hash_password(password))
         USERS.append(user)
@@ -526,7 +657,7 @@ def create_user(name, password, role="user", enabled=True):
 
 
 def set_user_password(username, password):
-    password = check_password_value(password)
+    password = check_password_value(password, username)
     user = find_user(username)
     if not user:
         raise ValueError("账号不存在")
@@ -650,7 +781,7 @@ def session_user(handler):
     if not item:
         return None
     user = find_user(item.get("u"))
-    if not user or not user.get("enabled"):
+    if not user or not user.get("enabled") or not user.get("approved", True):
         drop_session(token)
         return None
     return dict(user)
@@ -685,6 +816,10 @@ def user_public(user):
     return {"username": user["username"],
             "role": user["role"],
             "enabled": bool(user.get("enabled")),
+            "approved": bool(user.get("approved", True)),
+            "primary": bool(user.get("primary")),
+            "created_via": user.get("created_via") or "admin",
+            "fnos_username": user.get("fnos_username") or "",
             "created": user.get("created") or 0,
             "updated": user.get("updated") or 0}
 
@@ -1764,7 +1899,7 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return True
         open_paths = ("/api/auth/status", "/api/auth/setup",
-                      "/api/auth/login", "/api/auth/logout")
+                      "/api/auth/register", "/api/auth/login", "/api/auth/logout")
         if path in open_paths:
             return True
         if self.current_user():
@@ -1796,10 +1931,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_auth_status()
             elif path == "/api/users":
                 self.api_users()
+            elif path == "/api/registration":
+                self.api_registration()
             elif path == "/api/config":
                 self.api_config()
             elif path == "/api/tools":
                 user = self.current_user()
+                identity = detect_fnos_identity(self)
                 info = tool_info()
                 info.update({
                     "input_dir": INPUT_DIR,
@@ -1811,8 +1949,12 @@ class Handler(BaseHTTPRequestHandler):
                     "username": user["username"] if user else "",
                     "role": user["role"] if user else "",
                     "is_admin": bool(user and user.get("role") == "admin"),
-                    "identity_source": FNOS_IDENTITY_SOURCE,
-                    "identity_note": FNOS_IDENTITY_NOTE,
+                    "primary": bool(user and user.get("primary")),
+                    "identity_source": identity.get("source") if identity else "none",
+                    "identity_note": identity_note(identity),
+                    "identity_detected": bool(identity),
+                    "allow_register": bool(ALLOW_REGISTER),
+                    "register_approval": bool(REGISTER_APPROVAL),
                 })
                 self.send_json(info)
             elif path == "/api/update":
@@ -1838,6 +1980,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_auth_status(self):
         user = self.current_user()
+        identity = detect_fnos_identity(self)
+        primary = primary_user()
         self.send_json({
             "configured": users_configured(),
             "authenticated": bool(user),
@@ -1846,9 +1990,33 @@ class Handler(BaseHTTPRequestHandler):
             "username": user["username"] if user else "",
             "role": user["role"] if user else "",
             "is_admin": bool(user and user.get("role") == "admin"),
+            "primary": bool(user and user.get("primary")),
+            "primary_username": primary["username"] if primary else "",
             "auth_file": USERS_PATH,
-            "identity_source": FNOS_IDENTITY_SOURCE,
-            "identity_note": FNOS_IDENTITY_NOTE,
+            "allow_register": bool(ALLOW_REGISTER),
+            "register_approval": bool(REGISTER_APPROVAL),
+            "identity_source": identity.get("source") if identity else "none",
+            "identity_note": identity_note(identity),
+            "identity_detected": bool(identity),
+            "identity_username": identity.get("username") if identity else "",
+            "identity_is_admin": bool(identity and identity.get("is_admin")),
+        })
+
+    def api_registration(self):
+        if not self._require_admin():
+            return
+        identity = detect_fnos_identity(self)
+        primary = primary_user()
+        with USERS_LOCK:
+            pending = [u["username"] for u in USERS if not u.get("approved", True)]
+        self.send_json({
+            "allow_register": bool(ALLOW_REGISTER),
+            "register_approval": bool(REGISTER_APPROVAL),
+            "identity_source": identity.get("source") if identity else "none",
+            "identity_note": identity_note(identity),
+            "identity_detected": bool(identity),
+            "primary_username": primary["username"] if primary else "",
+            "pending": pending,
         })
 
     def api_users(self):
@@ -2080,12 +2248,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/auth/setup":
                 self.api_auth_setup()
+            elif path == "/api/auth/register":
+                self.api_auth_register()
             elif path == "/api/auth/login":
                 self.api_auth_login()
             elif path == "/api/auth/logout":
                 self.api_auth_logout()
             elif path == "/api/auth/password":
                 self.api_auth_password()
+            elif path == "/api/registration/settings":
+                self.api_registration_settings()
             elif path == "/api/users/create":
                 self.api_user_create()
             elif path == "/api/users/update":
@@ -2121,12 +2293,65 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = self.read_json()
         username = normalize_username(data.get("username") or "admin")
-        password = check_password_value(data.get("password"))
+        password = check_password_value(data.get("password"), username)
+        check_confirm(password, data.get("confirm"))
         remember = bool(data.get("remember", True))
-        create_user(username, password, role="admin", enabled=True)
+        identity = detect_fnos_identity(self)
+        create_user(username, password, role="admin", enabled=True, approved=True,
+                    primary=True, created_via="setup",
+                    fnos_uid=identity.get("uid") if identity else "",
+                    fnos_username=identity.get("username") if identity else "")
         token = issue_session(username, remember)
         self.send_json({"ok": True, "configured": True, "username": username,
-                        "role": "admin", "is_admin": True},
+                        "role": "admin", "is_admin": True, "primary": True},
+                       extra_headers=self._session_saved(token, remember))
+
+    def api_auth_register(self):
+        if users_configured() and not ALLOW_REGISTER:
+            self.send_json({"error": "管理员已关闭公开注册，请联系管理员创建账号",
+                            "code": "register_disabled"}, 403)
+            return
+        data = self.read_json()
+        username = normalize_username(data.get("username"))
+        password = check_password_value(data.get("password"), username)
+        check_confirm(password, data.get("confirm"))
+        remember = bool(data.get("remember", True))
+        identity = detect_fnos_identity(self)
+        if identity:
+            bound = fnos_bound_user(identity.get("uid"), identity.get("username"))
+            if bound:
+                self.send_json({"error": "该飞牛账号已注册：%s" % bound["username"],
+                                "code": "fnos_bound"}, 409)
+                return
+        with USERS_LOCK:
+            first = not USERS
+            has_primary = any(u.get("primary") for u in USERS)
+        if identity:
+            role = "admin" if identity.get("is_admin") else "user"
+            primary = bool(identity.get("is_admin") and not has_primary)
+            approved = bool(identity.get("is_admin")) or not REGISTER_APPROVAL
+        else:
+            role = "admin" if first else "user"
+            primary = bool(first)
+            approved = bool(first) or not REGISTER_APPROVAL
+        user = create_user(username, password, role=role, enabled=True,
+                           approved=approved, primary=primary, created_via="register",
+                           fnos_uid=identity.get("uid") if identity else "",
+                           fnos_username=identity.get("username") if identity else "")
+        if not approved:
+            primary_name = primary_user()
+            self.send_json({
+                "ok": True, "pending": True, "approved": False,
+                "username": username,
+                "message": "注册申请已提交，请等待管理员审批后登录",
+                "primary_username": primary_name["username"] if primary_name else "",
+            }, 202)
+            return
+        token = issue_session(username, remember)
+        self.send_json({"ok": True, "configured": True, "username": username,
+                        "role": user["role"], "is_admin": user["role"] == "admin",
+                        "primary": bool(user.get("primary")),
+                        "identity_source": identity.get("source") if identity else "none"},
                        extra_headers=self._session_saved(token, remember))
 
     def api_auth_login(self):
@@ -2144,11 +2369,14 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(password, str):
             password = ""
         user = find_user(username)
-        if not user or not user.get("enabled") or not _check_password(user, password):
+        if not user or not user.get("enabled") or not user.get("approved", True) \
+                or not _check_password(user, password):
             note_login_fail(ip)
             time.sleep(0.35)
             if user and not user.get("enabled"):
                 self.send_json({"error": "该账号已被停用", "code": "disabled"}, 403)
+            elif user and not user.get("approved", True):
+                self.send_json({"error": "账号等待管理员审批", "code": "pending"}, 403)
             else:
                 self.send_json({"error": "账号或密码不正确", "code": "bad_password"}, 401)
             return
@@ -2157,7 +2385,8 @@ class Handler(BaseHTTPRequestHandler):
         token = issue_session(user["username"], remember)
         self.send_json({"ok": True, "configured": True,
                         "username": user["username"], "role": user["role"],
-                        "is_admin": user["role"] == "admin"},
+                        "is_admin": user["role"] == "admin",
+                        "primary": bool(user.get("primary"))},
                        extra_headers=self._session_saved(token, remember))
 
     def api_auth_logout(self):
@@ -2178,14 +2407,29 @@ class Handler(BaseHTTPRequestHandler):
         drop_user_sessions(user["username"], keep=token)
         self.send_json({"ok": True})
 
+    def api_registration_settings(self):
+        global ALLOW_REGISTER, REGISTER_APPROVAL
+        if not self._require_admin():
+            return
+        data = self.read_json()
+        if "allow_register" in data:
+            ALLOW_REGISTER = bool(data.get("allow_register"))
+        if "register_approval" in data:
+            REGISTER_APPROVAL = bool(data.get("register_approval"))
+        save_config()
+        self.send_json({"ok": True, "allow_register": bool(ALLOW_REGISTER),
+                        "register_approval": bool(REGISTER_APPROVAL)})
+
     def api_user_create(self):
         if not self._require_admin():
             return
         data = self.read_json()
         username = normalize_username(data.get("username"))
-        password = check_password_value(data.get("password"))
+        password = check_password_value(data.get("password"), username)
+        check_confirm(password, data.get("confirm"), required=False)
         role = "admin" if data.get("role") == "admin" else "user"
-        user = create_user(username, password, role=role, enabled=True)
+        user = create_user(username, password, role=role, enabled=True,
+                           approved=True, created_via="admin")
         self.send_json({"ok": True, "user": user_public(user)})
 
     def api_user_update(self):
@@ -2197,6 +2441,15 @@ class Handler(BaseHTTPRequestHandler):
         user = find_user(username)
         if not user:
             raise ValueError("账号不存在")
+        if user.get("primary"):
+            if data.get("enabled") is False:
+                raise ValueError("主账号不能被停用")
+            if data.get("approved") is False:
+                raise ValueError("主账号不能被取消审批")
+            if "role" in data and data.get("role") != "admin":
+                raise ValueError("主账号不能被降级")
+        if "approved" in data:
+            user["approved"] = bool(data.get("approved"))
         if "enabled" in data:
             enabled = bool(data.get("enabled"))
             if not enabled and user["username"] == operator["username"]:
@@ -2216,7 +2469,7 @@ class Handler(BaseHTTPRequestHandler):
             save_users()
         except OSError:
             raise ValueError("保存账号失败，请检查配置目录权限")
-        if not user.get("enabled"):
+        if not user.get("enabled") or not user.get("approved", True):
             drop_user_sessions(user["username"])
         self.send_json({"ok": True, "user": user_public(user)})
 
@@ -2241,6 +2494,8 @@ class Handler(BaseHTTPRequestHandler):
             target = next((u for u in USERS if u["username"] == username), None)
             if not target:
                 raise ValueError("账号不存在")
+            if target.get("primary"):
+                raise ValueError("主账号不能删除")
             if target["role"] == "admin" and admin_count() <= 1:
                 raise ValueError("至少需要保留一个管理员账号")
             USERS.remove(target)

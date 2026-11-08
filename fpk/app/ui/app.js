@@ -14,8 +14,8 @@
     tools: {},
     files: [],
     merge: [],
-    mergeNameMode: "manual",
-    mergeNamePath: "",
+    mergeNameAuto: true,
+    mergeNameLast: "",
     view: "merge",
     processSub: "convert",
     convertExt: "mp4",
@@ -31,7 +31,10 @@
     updateBusy: false,
     users: [],
     auth: { configured: false, authenticated: false, setup: false, busy: false,
-            username: "", role: "", isAdmin: false, authFile: "" }
+            username: "", role: "", isAdmin: false, authFile: "", primary: false,
+            mode: "login", allowRegister: true, registerApproval: false,
+            identityNote: "", identityDetected: false, identityUsername: "",
+            primaryUsername: "" }
   };
 
   var VIEW_META = {
@@ -128,14 +131,9 @@
       .replace(/_{2,}/g, "_");
   }
 
-  function mergeNameFrom(path) {
-    var value = sanitizeFileName(stem(path));
-    return (value || "merged") + ".mp4";
-  }
-
-  function mergeCommonName(paths) {
+  function mergePrefixInfo(paths) {
     var stems = paths.map(function (p) { return sanitizeFileName(stem(p)) || "merged"; });
-    if (!stems.length) return "";
+    if (!stems.length) return { prefix: "", stems: stems, tooShort: true };
     var prefix = stems[0];
     for (var i = 1; i < stems.length; i++) {
       var j = 0;
@@ -146,9 +144,15 @@
       prefix = prefix.slice(0, j);
     }
     prefix = prefix.replace(/[\s._\-]+$/, "");
+    var tooShort = prefix.length < 2 && stems.length > 1;
     if (prefix.length < 2) prefix = stems[0];
     prefix = sanitizeFileName(prefix) || "merged";
-    return prefix + ".mp4";
+    return { prefix: prefix, stems: stems, tooShort: tooShort };
+  }
+
+  function mergeCommonName(paths) {
+    if (!paths.length) return "";
+    return (mergePrefixInfo(paths).prefix || "merged") + ".mp4";
   }
 
   function joinOut(name) {
@@ -217,50 +221,98 @@
     box.hidden = !message;
   }
 
-  function showAuth(configured) {
-    state.auth.configured = !!configured;
-    state.auth.setup = !configured;
+  function fillAuthHint() {
+    var hint = $("#authHint");
+    if (!hint) return;
+    var auth = state.auth;
+    var text;
+    if (!auth.configured) {
+      text = "首次注册的账号即主账号管理员，拥有用户管理权限。忘记密码可删除配置目录中的 users.json 与 sessions.json，或启动前设置 VT_RESET_AUTH=1。";
+    } else if (auth.mode === "register") {
+      text = auth.identityNote || "注册后即可使用下载与处理功能。";
+      if (auth.registerApproval) text += " 当前已开启注册审批，需管理员批准后才能登录。";
+    } else {
+      text = "忘记密码？停止应用后删除配置目录中的 users.json 与 sessions.json，或启动前设置环境变量 VT_RESET_AUTH=1，重新启动后即可重新设置管理员。";
+    }
+    hint.textContent = text;
+    hint.hidden = false;
+  }
+
+  function setAuthMode(mode) {
+    var auth = state.auth;
+    if (!auth.configured) mode = "setup";
+    if (mode === "register" && auth.configured && !auth.allowRegister) mode = "login";
+    auth.mode = mode;
+    var setup = !auth.configured;
+    var register = mode === "register";
+    var tabs = $("#authTabs");
+    if (tabs) {
+      tabs.hidden = setup;
+      $$(".auth-tab", tabs).forEach(function (btn) {
+        btn.classList.toggle("active", btn.getAttribute("data-mode") === mode);
+        if (btn.getAttribute("data-mode") === "register") btn.hidden = !auth.allowRegister;
+      });
+    }
+    $("#authTitle").textContent = setup ? "创建主账号" : register ? "注册账号" : "登录";
+    $("#authDesc").textContent = setup
+      ? "首次使用：第一个注册的账号就是主账号管理员（密码至少 8 位，需含字母和数字）"
+      : register
+        ? "填写账号与密码完成注册"
+        : "请输入账号与密码继续使用";
+    $("#authSubmit").textContent = setup ? "创建并进入" : register ? "注册" : "登录";
+    $("#authPassword").autocomplete = (setup || register) ? "new-password" : "current-password";
+    $("#authConfirmField").hidden = !(setup || register);
+    $("#authPassword").value = "";
+    $("#authConfirm").value = "";
+    $("#authRemember").checked = true;
+    var nameInput = $("#authUsername");
+    if (setup || register) {
+      var suggested = (auth.identityUsername || "").trim();
+      nameInput.value = (suggested && /^[A-Za-z0-9_.-]{2,32}$/.test(suggested))
+        ? suggested.toLowerCase() : (setup ? "admin" : "");
+      nameInput.placeholder = setup ? "admin" : "2-32 位字母、数字、_ . -";
+    } else {
+      var saved = "";
+      try { saved = localStorage.getItem("vt-user") || ""; } catch (e) {}
+      nameInput.value = saved;
+      nameInput.placeholder = "例如 admin";
+    }
+    nameInput.disabled = false;
+    fillAuthHint();
+    setAuthError("");
+    setTimeout(function () {
+      if ($("#authModal").hidden) return;
+      if (!setup && !register) $("#authPassword").focus();
+      else if (!nameInput.value) nameInput.focus();
+      else $("#authPassword").focus();
+    }, 60);
+  }
+
+  function showAuth() {
     state.auth.authenticated = false;
     var modal = $("#authModal");
     if (!modal) return;
     modal.hidden = false;
-    $("#authTitle").textContent = configured ? "登录" : "创建管理员账号";
-    $("#authDesc").textContent = configured
-      ? "请输入账号与密码继续使用"
-      : "首次使用，请设置管理员账号与密码（密码至少 8 个字符）";
-    $("#authSubmit").textContent = configured ? "登录" : "创建并进入";
-    $("#authPassword").autocomplete = configured ? "current-password" : "new-password";
-    $("#authPassword").value = "";
-    $("#authRemember").checked = true;
-    if (configured) {
-      var saved = "";
-      try { saved = localStorage.getItem("vt-user") || ""; } catch (e) {}
-      $("#authUsername").value = saved;
-      $("#authUsername").placeholder = "例如 admin";
-    } else {
-      $("#authUsername").value = "admin";
-      $("#authUsername").placeholder = "admin";
-    }
-    $("#authUsername").disabled = false;
-    $("#authRemember").disabled = false;
-    $("#authHint").hidden = false;
-    setAuthError("");
-    setTimeout(function () {
-      if (!modal.hidden) {
-        if (!configured) $("#authUsername").focus();
-        else $("#authPassword").focus();
-      }
-    }, 60);
+    setAuthMode(state.auth.configured ? "login" : "setup");
   }
 
   function applyAuthStatus(data) {
     data = data || {};
-    state.auth.configured = !!data.configured;
-    state.auth.authenticated = !!data.authenticated;
-    state.auth.username = data.username || "";
-    state.auth.role = data.role || "";
-    state.auth.isAdmin = !!data.is_admin;
-    if (data.auth_file) state.auth.authFile = data.auth_file;
+    var auth = state.auth;
+    auth.configured = !!data.configured;
+    auth.setup = !auth.configured;
+    auth.authenticated = !!data.authenticated;
+    auth.username = data.username || "";
+    auth.role = data.role || "";
+    auth.isAdmin = !!data.is_admin;
+    auth.primary = !!data.primary;
+    auth.allowRegister = data.allow_register !== false;
+    auth.registerApproval = !!data.register_approval;
+    auth.identityNote = data.identity_note || "";
+    auth.identityDetected = !!data.identity_detected;
+    auth.identityUsername = data.identity_username || "";
+    auth.primaryUsername = data.primary_username || "";
+    if (data.auth_file) auth.authFile = data.auth_file;
   }
 
   function handleUnauthorized() {
@@ -271,7 +323,7 @@
       $("#logModal").hidden = true;
     }
     if (!$("#authModal").hidden) return;
-    showAuth(state.auth.configured);
+    showAuth();
   }
 
   function checkAuth() {
@@ -285,10 +337,10 @@
       .then(function (data) {
         applyAuthStatus(data);
         if (state.auth.authenticated) startApp();
-        else showAuth(state.auth.configured);
+        else showAuth();
       })
       .catch(function (err) {
-        showAuth(state.auth.configured);
+        showAuth();
         setAuthError("无法连接服务：" + err.message);
       });
   }
@@ -296,6 +348,9 @@
   function submitAuth(event) {
     event.preventDefault();
     if (state.auth.busy) return;
+    var auth = state.auth;
+    var setup = !auth.configured;
+    var register = auth.configured && auth.mode === "register";
     var username = ($("#authUsername").value || "").trim();
     var password = $("#authPassword").value;
     if (!/^[A-Za-z0-9_.-]{2,32}$/.test(username)) {
@@ -308,27 +363,47 @@
       $("#authPassword").focus();
       return;
     }
+    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+      setAuthError("密码需同时包含字母和数字");
+      $("#authPassword").focus();
+      return;
+    }
+    if ((setup || register) && password !== $("#authConfirm").value) {
+      setAuthError("两次输入的密码不一致");
+      $("#authConfirm").focus();
+      return;
+    }
     state.auth.busy = true;
     $("#authSubmit").disabled = true;
     setAuthError("");
-    var wasSetup = state.auth.setup;
-    var path = wasSetup ? "/api/auth/setup" : "/api/auth/login";
+    var path = setup ? "/api/auth/setup" : register ? "/api/auth/register" : "/api/auth/login";
     authFetch(path, {
       username: username,
       password: password,
+      confirm: $("#authConfirm").value,
       remember: !!$("#authRemember").checked
     }).then(function (data) {
+      if (data && data.pending) {
+        state.auth.busy = false;
+        $("#authSubmit").disabled = false;
+        setAuthMode("login");
+        setAuthError(data.message || "注册申请已提交，请等待管理员审批");
+        toast("注册申请已提交，等待管理员审批", "success", 3000);
+        return;
+      }
       try { localStorage.setItem("vt-user", username); } catch (e) {}
       state.auth.busy = false;
       state.auth.configured = true;
       state.auth.authenticated = true;
       state.auth.setup = false;
+      state.auth.mode = "login";
       state.auth.username = data.username || username;
       state.auth.role = data.role || "";
       state.auth.isAdmin = !!data.is_admin;
+      state.auth.primary = !!data.primary;
       $("#authSubmit").disabled = false;
       $("#authModal").hidden = true;
-      toast(wasSetup ? "管理员账号已创建" : "已登录", "success", 1800);
+      toast(setup ? "主账号已创建" : register ? "注册成功" : "已登录", "success", 1800);
       startApp();
     }).catch(function (err) {
       state.auth.busy = false;
@@ -345,7 +420,7 @@
       state.auth.authenticated = false;
       state.users = [];
       stopPolling();
-      showAuth(true);
+      showAuth();
       toast("已退出登录", "success", 1800);
     });
   }
@@ -369,12 +444,14 @@
     }
     var path = $("#authFilePath");
     if (path) path.textContent = state.auth.authFile || "users.json";
-    if (state.auth.isAdmin && state.tools && state.tools.identity_note) {
-      var note = $("#identityNote");
-      if (note) {
-        note.hidden = false;
-        note.textContent = "管理员来源：" + (state.tools.identity_note || "");
-      }
+    var note = $("#identityNote");
+    if (note) {
+      var text = "";
+      if (state.auth.primary) text = "当前账号是主账号管理员。";
+      else if (state.auth.primaryUsername) text = "当前主账号：" + state.auth.primaryUsername + "。";
+      if (state.auth.identityNote) text += (text ? " " : "") + state.auth.identityNote;
+      note.hidden = !text;
+      note.textContent = text;
     }
   }
 
@@ -384,14 +461,22 @@
     var me = state.auth.username;
     var html = state.users.map(function (u) {
       var self = u.username === me;
+      var badges = '<span class="role-chip' + (u.role === "admin" ? " admin" : "") + '">' +
+        (u.role === "admin" ? "管理员" : "普通用户") + '</span>';
+      if (u.primary) badges += '<span class="role-chip primary">主账号</span>';
+      if (u.approved === false) badges += '<span class="user-state pending">待审批</span>';
+      badges += '<span class="user-state' + (u.enabled ? " ok" : " off") + '">' +
+        (u.enabled ? "启用" : "已停用") + '</span>';
+      if (self) badges += '<span class="user-self">当前</span>';
+      var meta = [];
+      if (u.created_via === "register") meta.push("自助注册");
+      if (u.fnos_username) meta.push("飞牛账号 " + u.fnos_username);
       return '<div class="user-row">' +
-        '<div class="user-main"><strong>' + esc(u.username) + '</strong>' +
-        '<span class="role-chip' + (u.role === "admin" ? " admin" : "") + '">' +
-        (u.role === "admin" ? "管理员" : "普通用户") + '</span>' +
-        '<span class="user-state' + (u.enabled ? " ok" : " off") + '">' +
-        (u.enabled ? "启用" : "已停用") + '</span>' +
-        (self ? '<span class="user-self">当前</span>' : '') + '</div>' +
+        '<div class="user-main"><strong>' + esc(u.username) + '</strong>' + badges +
+        (meta.length ? '<span class="user-meta">' + esc(meta.join(" · ")) + '</span>' : '') +
+        '</div>' +
         '<div class="user-ops">' +
+        (u.approved === false ? '<button class="btn primary small" data-user-approve="' + esc(u.username) + '">批准</button>' : '') +
         '<button class="btn ghost small" data-user-reset="' + esc(u.username) + '">重置密码</button>' +
         '<button class="btn ghost small" data-user-toggle="' + esc(u.username) + '" data-enabled="' + (u.enabled ? "1" : "0") + '"' +
         (self ? ' disabled title="不能停用当前账号"' : '') + '>' + (u.enabled ? "停用" : "启用") + '</button>' +
@@ -402,11 +487,62 @@
     box.innerHTML = html || '<p class="hint">暂无用户</p>';
   }
 
+  function approveUser(name) {
+    post("/api/users/update", { username: name, approved: true })
+      .then(function () {
+        toast("已批准 " + name + " 的注册申请", "success", 2200);
+        loadUsers();
+      }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
+  function renderRegisterSettings() {
+    var card = $("#registerCard");
+    if (!card || !state.auth.isAdmin) return;
+    card.hidden = false;
+    var allow = $("#allowRegister");
+    var approval = $("#registerApproval");
+    if (allow) allow.checked = !!state.auth.allowRegister;
+    if (approval) approval.checked = !!state.auth.registerApproval;
+    var chip = $("#primaryChip");
+    if (chip) {
+      chip.textContent = "主账号：" + (state.auth.primaryUsername || "-");
+      chip.className = "role-chip primary";
+    }
+    var info = $("#registerInfo");
+    if (info) {
+      var pending = state.users.filter(function (u) { return u.approved === false; });
+      var rows = [
+        ["公开注册", state.auth.allowRegister ? "已开启" : "已关闭"],
+        ["注册审批", state.auth.registerApproval ? "需要审批" : "无需审批"],
+        ["待审批账号", pending.length ? pending.map(function (u) { return u.username; }).join("、") : "无"],
+        ["身份来源", state.auth.identityDetected ? state.auth.identityNote : "未识别飞牛账号"]
+      ];
+      info.innerHTML = rows.map(function (r) {
+        return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[1]) + '">' + esc(r[1]) + '</span></div>';
+      }).join("");
+    }
+    var note = $("#registerIdentityNote");
+    if (note) note.textContent = state.auth.identityNote || "";
+  }
+
+  function saveRegisterSettings() {
+    post("/api/registration/settings", {
+      allow_register: !!$("#allowRegister").checked,
+      register_approval: !!$("#registerApproval").checked
+    }).then(function (data) {
+      state.auth.allowRegister = !!data.allow_register;
+      state.auth.registerApproval = !!data.register_approval;
+      toast("注册设置已保存", "success", 2000);
+      renderRegisterSettings();
+    }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
   function loadUsers() {
     if (!state.auth.isAdmin) return Promise.resolve();
     return api("/api/users").then(function (data) {
       state.users = (data && data.users) || [];
       renderUsers();
+      renderRegisterSettings();
     }).catch(function (err) {
       if (!err.unauthorized) toast("加载用户失败：" + err.message, "error", 6000);
     });
@@ -422,6 +558,10 @@
     }
     if (password.length < 8) {
       toast("密码至少需要 8 个字符", "error", 5000);
+      return;
+    }
+    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+      toast("密码需同时包含字母和数字", "error", 5000);
       return;
     }
     post("/api/users/create", { username: username, password: password, role: role })
@@ -442,9 +582,12 @@
   }
 
   function resetUserPassword(name) {
-    var password = window.prompt("为账号 " + name + " 设置新密码（至少 8 个字符）", "");
+    var password = window.prompt("为账号 " + name + " 设置新密码（至少 8 位，需含字母和数字）", "");
     if (password === null) return;
     if (password.length < 8) { toast("密码至少需要 8 个字符", "error", 5000); return; }
+    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+      toast("密码需同时包含字母和数字", "error", 5000); return;
+    }
     post("/api/users/password", { username: name, password: password })
       .then(function () {
         toast("密码已重置，该账号需重新登录", "success", 2600);
@@ -466,11 +609,21 @@
     if (t.username) state.auth.username = t.username;
     if (t.role) state.auth.role = t.role;
     state.auth.isAdmin = !!t.is_admin;
+    state.auth.primary = !!t.primary;
     if (t.auth_file) state.auth.authFile = t.auth_file;
+    if (typeof t.allow_register === "boolean") state.auth.allowRegister = t.allow_register;
+    if (typeof t.register_approval === "boolean") state.auth.registerApproval = t.register_approval;
+    if (t.identity_note) state.auth.identityNote = t.identity_note;
+    if (t.identity_detected !== undefined) state.auth.identityDetected = !!t.identity_detected;
     renderAccount();
     var card = $("#usersCard");
     if (card) card.hidden = !state.auth.isAdmin;
-    if (state.auth.isAdmin) loadUsers();
+    var reg = $("#registerCard");
+    if (reg) reg.hidden = !state.auth.isAdmin;
+    if (state.auth.isAdmin) {
+      renderRegisterSettings();
+      loadUsers();
+    }
   }
 
   function stopPolling() {
@@ -861,7 +1014,7 @@
     });
     $("#mergeSelCount").textContent = state.merge.length;
     $("#mergeSelEmpty").hidden = state.merge.length > 0;
-    updateMergeNameReference();
+    updateMergeNameAuto();
   }
 
   function moveMerge(idx, delta) {
@@ -873,53 +1026,30 @@
     renderMergeSelected();
   }
 
-  function syncMergeNameSelect() {
-    var sel = $("#mergeNameFrom");
-    if (!sel) return;
-    var value = state.mergeNameMode === "file"
-      ? "file:" + state.mergeNamePath : state.mergeNameMode;
-    var html = '<option value="manual">手动输入</option>' +
-      '<option value="common">公共部分</option>';
-    state.merge.forEach(function (path) {
-      var f = mergeFileByPath(path);
-      html += '<option value="file:' + esc(path) + '">文件名：' +
-        esc(f ? (f.name || baseName(path)) : baseName(path)) + "</option>";
-    });
-    sel.innerHTML = html;
-    sel.value = value;
-    if (!sel.value) {
-      state.mergeNameMode = "manual";
-      state.mergeNamePath = "";
-      sel.value = "manual";
-    }
-  }
-
-  function applyMergeNameReference() {
-    if (state.mergeNameMode === "manual") return;
-    var value = "";
-    if (state.mergeNameMode === "file") {
-      if (state.merge.indexOf(state.mergeNamePath) >= 0) {
-        value = mergeNameFrom(state.mergeNamePath);
-      }
-    } else if (state.merge.length) {
-      value = mergeCommonName(state.merge);
-    }
-    if (!value) return;
+  function updateMergeNameAuto() {
     var input = $("#mergeOutput");
-    if (input) input.value = value;
+    var hint = $("#mergeNameHint");
+    if (!input) return;
+    if (!state.merge.length) {
+      if (hint && state.mergeNameAuto) {
+        hint.textContent = "选择输入文件后自动识别文件名公共部分，仍可手动修改";
+      }
+      return;
+    }
+    if (!state.mergeNameAuto) {
+      if (hint) hint.textContent = "已手动修改文件名，增删输入文件不会再自动覆盖";
+      return;
+    }
+    var info = mergePrefixInfo(state.merge);
+    var value = (info.prefix || "merged") + ".mp4";
+    input.value = value;
+    state.mergeNameLast = value;
+    if (hint) {
+      if (info.stems.length === 1) hint.textContent = "已使用输入文件名：" + info.stems[0];
+      else if (info.tooShort) hint.textContent = "公共部分过短，已使用第一个文件名：" + info.stems[0];
+      else hint.textContent = "已按输入文件名识别公共部分：" + info.prefix;
+    }
     updatePreviews();
-  }
-
-  function updateMergeNameReference() {
-    if (state.mergeNameMode === "file" && state.merge.indexOf(state.mergeNamePath) < 0) {
-      state.mergeNameMode = "common";
-      state.mergeNamePath = "";
-    }
-    if (state.mergeNameMode === "common" && !state.merge.length) {
-      state.mergeNameMode = "manual";
-    }
-    syncMergeNameSelect();
-    applyMergeNameReference();
   }
 
   function populateSelects() {
@@ -1457,26 +1587,12 @@
     });
     $("#mergeRun").addEventListener("click", runMerge);
     $("#mergeOutput").addEventListener("input", function () {
-      if (state.mergeNameMode !== "manual") {
-        state.mergeNameMode = "manual";
-        state.mergeNamePath = "";
-        syncMergeNameSelect();
+      if (this.value !== state.mergeNameLast) {
+        state.mergeNameAuto = false;
+        var hint = $("#mergeNameHint");
+        if (hint) hint.textContent = "已手动修改文件名，增删输入文件不会再自动覆盖";
       }
       updatePreviews();
-    });
-    $("#mergeNameFrom").addEventListener("change", function () {
-      var value = this.value || "manual";
-      if (value === "manual" || value === "common") {
-        state.mergeNameMode = value;
-        state.mergeNamePath = "";
-      } else if (value.indexOf("file:") === 0) {
-        state.mergeNameMode = "file";
-        state.mergeNamePath = value.slice(5);
-      } else {
-        state.mergeNameMode = "manual";
-        state.mergeNamePath = "";
-      }
-      updateMergeNameReference();
     });
   }
 
@@ -1591,12 +1707,17 @@
       }).catch(function (err) { toast(err.message, "error", 6000); });
     });
     $("#authLogout").addEventListener("click", logout);
+    if ($("#saveRegisterSettings")) {
+      $("#saveRegisterSettings").addEventListener("click", saveRegisterSettings);
+    }
     $("#usersRefresh").addEventListener("click", function () { loadUsers(); });
     $("#newUserCreate").addEventListener("click", createUser);
     $("#newUserPassword").addEventListener("keydown", function (e) {
       if (e.key === "Enter") { e.preventDefault(); createUser(); }
     });
     $("#userList").addEventListener("click", function (e) {
+      var approve = e.target.closest("[data-user-approve]");
+      if (approve) { approveUser(approve.getAttribute("data-user-approve")); return; }
       var reset = e.target.closest("[data-user-reset]");
       if (reset) { resetUserPassword(reset.getAttribute("data-user-reset")); return; }
       var toggle = e.target.closest("[data-user-toggle]");
@@ -1692,6 +1813,13 @@
     bindLog();
     bindGlobal();
     $("#authForm").addEventListener("submit", submitAuth);
+    var authTabs = $("#authTabs");
+    if (authTabs) {
+      authTabs.addEventListener("click", function (e) {
+        var btn = e.target.closest(".auth-tab");
+        if (btn) setAuthMode(btn.getAttribute("data-mode"));
+      });
+    }
 
     var initial = (window.location.hash || "").replace(/^#/, "");
     setView(VIEW_META[initial] ? initial : "merge");

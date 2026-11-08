@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.5.0">
+<link rel="stylesheet" href="style.css?v=1.6.0">
 </head>
 <body>
 <div class="app">
@@ -143,14 +143,8 @@
           </div>
           <div class="field">
             <label for="mergeOutput">输出文件名</label>
-            <div class="input-with-btn">
-              <input id="mergeOutput" type="text" value="merged.mkv">
-              <select id="mergeNameFrom" title="引用输入文件名">
-                <option value="manual">手动输入</option>
-                <option value="common">公共部分</option>
-              </select>
-            </div>
-            <p class="hint">选择「公共部分」或具体输入文件自动填入文件名，仍可手动修改；公共部分过短时会改用第一个文件名</p>
+            <input id="mergeOutput" type="text" value="merged.mp4" spellcheck="false">
+            <p class="hint" id="mergeNameHint">选择输入文件后自动识别文件名公共部分，仍可手动修改</p>
           </div>
           <label class="switch-row">
             <input type="checkbox" id="mergeReencode">
@@ -584,6 +578,27 @@
         </div>
       </div>
 
+      <div class="card settings-more" id="registerCard" hidden>
+        <div class="card-head">
+          <h2>注册与主账号</h2>
+          <span class="role-chip" id="primaryChip">-</span>
+        </div>
+        <div class="kv" id="registerInfo"></div>
+        <label class="switch-row">
+          <input type="checkbox" id="allowRegister">
+          <span class="switch"></span>
+          <div><strong>允许公开注册</strong><small>关闭后只能由管理员在下方「用户管理」中创建账号</small></div>
+        </label>
+        <label class="switch-row">
+          <input type="checkbox" id="registerApproval">
+          <span class="switch"></span>
+          <div><strong>注册需要审批</strong><small>开启后新注册账号需管理员批准才能登录</small></div>
+        </label>
+        <p class="hint" id="registerIdentityNote"></p>
+        <p class="hint">主账号说明：飞牛主账号能通过官方统一网关下发的 <code>X-Trim-Username</code> / <code>X-Trim-Userid</code> / <code>X-Trim-Isadmin</code> 请求头识别；本应用使用端口服务入口，官方文档明确端口服务不携带 NAS 登录态，因此实际拿不到飞牛账号，按「首个完成注册的账号为主账号」处理，不伪装成已识别。README 中同样写明了该限制。</p>
+        <button class="btn ghost small" id="saveRegisterSettings">保存注册设置</button>
+      </div>
+
       <div class="card settings-more" id="usersCard" hidden>
         <div class="card-head">
           <h2>用户管理</h2>
@@ -598,7 +613,7 @@
           </div>
           <div class="field">
             <label for="newUserPassword">密码</label>
-            <input id="newUserPassword" type="password" placeholder="至少 8 个字符" maxlength="128" autocomplete="new-password">
+            <input id="newUserPassword" type="password" placeholder="至少 8 位，需含字母和数字" maxlength="128" autocomplete="new-password">
           </div>
           <div class="field">
             <label for="newUserRole">角色</label>
@@ -609,7 +624,7 @@
           </div>
         </div>
         <button class="btn primary block" id="newUserCreate">新增用户</button>
-        <p class="hint">账号名支持 2-32 位字母、数字、下划线、点或短横线。普通用户可使用下载与处理功能，但看不到用户管理；管理员不能删除自己。</p>
+        <p class="hint">账号名支持 2-32 位字母、数字、下划线、点或短横线；密码至少 8 位且需同时包含字母和数字。普通用户可使用下载与处理功能，但看不到用户管理；主账号不可删除或停用。</p>
       </div>
 
       <div class="card settings-more">
@@ -682,7 +697,7 @@
 
 <div class="toasts" id="toasts"></div>
 
-<!-- 登录 / 首次设置 -->
+<!-- 登录 / 注册 / 首次创建主账号 -->
 <div class="modal-backdrop" id="authModal" hidden>
   <div class="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
     <div class="modal-head">
@@ -691,6 +706,10 @@
         <p class="log-sub" id="authDesc">请输入账号与密码</p>
       </div>
     </div>
+    <div class="auth-tabs" id="authTabs" hidden>
+      <button type="button" class="auth-tab active" data-mode="login">登录</button>
+      <button type="button" class="auth-tab" data-mode="register">注册</button>
+    </div>
     <form id="authForm">
       <div class="field">
         <label for="authUsername">账号</label>
@@ -698,9 +717,13 @@
       </div>
       <div class="field">
         <label for="authPassword">密码</label>
-        <input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128" placeholder="至少 8 个字符" required>
+        <input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128" placeholder="至少 8 位，需含字母和数字" required>
       </div>
-      <label class="check-row"><input id="authRemember" type="checkbox" checked> 记住我（关闭浏览器后仍保持登录）</label>
+      <div class="field" id="authConfirmField" hidden>
+        <label for="authConfirm">确认密码</label>
+        <input id="authConfirm" type="password" autocomplete="new-password" maxlength="128" placeholder="再次输入密码">
+      </div>
+      <label class="check-row" id="authRememberRow"><input id="authRemember" type="checkbox" checked> 记住我（关闭浏览器后仍保持登录）</label>
       <p class="auth-error" id="authError" hidden></p>
       <button class="btn primary block" id="authSubmit" type="submit">登录</button>
     </form>
@@ -756,6 +779,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.5.0"></script>
+<script src="app.js?v=1.6.0"></script>
 </body>
 </html>
