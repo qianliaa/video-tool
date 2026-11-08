@@ -1115,6 +1115,70 @@ details.adv summary:hover { color: var(--text); }
 .update-status a { color: var(--accent-text); text-decoration: underline; }
 .about-link { color: var(--accent-text); }
 
+/* ---------- 账号与用户 ---------- */
+
+.modal.auth-modal { max-width: 420px; }
+.auth-error {
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.auth-hint {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 12px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.check-row input { width: auto; min-height: 0; }
+.role-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.role-chip.admin { background: var(--accent-soft); color: var(--accent-text); }
+.account-actions { margin-top: 12px; }
+.user-list { display: flex; flex-direction: column; gap: 1px; margin-top: 4px; }
+.user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 2px;
+  border-bottom: 1px dashed var(--border);
+}
+.user-row:last-child { border-bottom: 0; }
+.user-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+.user-ops { display: flex; gap: 6px; flex-wrap: wrap; }
+.user-state { font-size: 11.5px; color: var(--muted); }
+.user-state.ok { color: var(--green); }
+.user-state.off { color: var(--red); }
+.user-self { font-size: 11px; color: var(--accent-text); }
+
 /* ---------- 提示条 ---------- */
 
 .toasts {

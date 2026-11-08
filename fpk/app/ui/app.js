@@ -28,7 +28,10 @@
     logId: null,
     logTimer: null,
     taskTimer: null,
-    updateBusy: false
+    updateBusy: false,
+    users: [],
+    auth: { configured: false, authenticated: false, setup: false, busy: false,
+            username: "", role: "", isAdmin: false, authFile: "" }
   };
 
   var VIEW_META = {
@@ -168,7 +171,17 @@
   function api(path, options) {
     return fetch(path, options).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.error) || ("请求失败（" + res.status + "）"));
+        if (res.status === 401) {
+          var deny = new Error((data && data.error) || "未登录或登录已过期");
+          deny.unauthorized = true;
+          handleUnauthorized();
+          throw deny;
+        }
+        if (!res.ok) {
+          var err = new Error((data && data.error) || ("请求失败（" + res.status + "）"));
+          err.status = res.status;
+          throw err;
+        }
         return data;
       });
     });
@@ -182,6 +195,284 @@
     });
   }
 
+  // ---------------------------------------------------------------- 登录
+
+  function authFetch(path, body) {
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) throw new Error((data && data.error) || ("请求失败（" + res.status + "）"));
+        return data;
+      });
+    });
+  }
+
+  function setAuthError(message) {
+    var box = $("#authError");
+    if (!box) return;
+    box.textContent = message || "";
+    box.hidden = !message;
+  }
+
+  function showAuth(configured) {
+    state.auth.configured = !!configured;
+    state.auth.setup = !configured;
+    state.auth.authenticated = false;
+    var modal = $("#authModal");
+    if (!modal) return;
+    modal.hidden = false;
+    $("#authTitle").textContent = configured ? "登录" : "创建管理员账号";
+    $("#authDesc").textContent = configured
+      ? "请输入账号与密码继续使用"
+      : "首次使用，请设置管理员账号与密码（密码至少 8 个字符）";
+    $("#authSubmit").textContent = configured ? "登录" : "创建并进入";
+    $("#authPassword").autocomplete = configured ? "current-password" : "new-password";
+    $("#authPassword").value = "";
+    $("#authRemember").checked = true;
+    if (configured) {
+      var saved = "";
+      try { saved = localStorage.getItem("vt-user") || ""; } catch (e) {}
+      $("#authUsername").value = saved;
+      $("#authUsername").placeholder = "例如 admin";
+    } else {
+      $("#authUsername").value = "admin";
+      $("#authUsername").placeholder = "admin";
+    }
+    $("#authUsername").disabled = false;
+    $("#authRemember").disabled = false;
+    $("#authHint").hidden = false;
+    setAuthError("");
+    setTimeout(function () {
+      if (!modal.hidden) {
+        if (!configured) $("#authUsername").focus();
+        else $("#authPassword").focus();
+      }
+    }, 60);
+  }
+
+  function applyAuthStatus(data) {
+    data = data || {};
+    state.auth.configured = !!data.configured;
+    state.auth.authenticated = !!data.authenticated;
+    state.auth.username = data.username || "";
+    state.auth.role = data.role || "";
+    state.auth.isAdmin = !!data.is_admin;
+    if (data.auth_file) state.auth.authFile = data.auth_file;
+  }
+
+  function handleUnauthorized() {
+    stopPolling();
+    state.auth.authenticated = false;
+    if (state.logId) {
+      state.logId = null;
+      $("#logModal").hidden = true;
+    }
+    if (!$("#authModal").hidden) return;
+    showAuth(state.auth.configured);
+  }
+
+  function checkAuth() {
+    return fetch("/api/auth/status", { cache: "no-store" })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (!res.ok) throw new Error((data && data.error) || ("访问校验失败（" + res.status + "）"));
+          return data;
+        });
+      })
+      .then(function (data) {
+        applyAuthStatus(data);
+        if (state.auth.authenticated) startApp();
+        else showAuth(state.auth.configured);
+      })
+      .catch(function (err) {
+        showAuth(state.auth.configured);
+        setAuthError("无法连接服务：" + err.message);
+      });
+  }
+
+  function submitAuth(event) {
+    event.preventDefault();
+    if (state.auth.busy) return;
+    var username = ($("#authUsername").value || "").trim();
+    var password = $("#authPassword").value;
+    if (!/^[A-Za-z0-9_.-]{2,32}$/.test(username)) {
+      setAuthError("账号名需为 2-32 位字母、数字、下划线、点或短横线");
+      $("#authUsername").focus();
+      return;
+    }
+    if (password.length < 8) {
+      setAuthError("密码至少需要 8 个字符");
+      $("#authPassword").focus();
+      return;
+    }
+    state.auth.busy = true;
+    $("#authSubmit").disabled = true;
+    setAuthError("");
+    var wasSetup = state.auth.setup;
+    var path = wasSetup ? "/api/auth/setup" : "/api/auth/login";
+    authFetch(path, {
+      username: username,
+      password: password,
+      remember: !!$("#authRemember").checked
+    }).then(function (data) {
+      try { localStorage.setItem("vt-user", username); } catch (e) {}
+      state.auth.busy = false;
+      state.auth.configured = true;
+      state.auth.authenticated = true;
+      state.auth.setup = false;
+      state.auth.username = data.username || username;
+      state.auth.role = data.role || "";
+      state.auth.isAdmin = !!data.is_admin;
+      $("#authSubmit").disabled = false;
+      $("#authModal").hidden = true;
+      toast(wasSetup ? "管理员账号已创建" : "已登录", "success", 1800);
+      startApp();
+    }).catch(function (err) {
+      state.auth.busy = false;
+      $("#authSubmit").disabled = false;
+      setAuthError(err.message);
+      $("#authPassword").select();
+    });
+  }
+
+  // ---------------------------------------------------------------- 账号与用户
+
+  function logout() {
+    authFetch("/api/auth/logout", {}).catch(function () {}).then(function () {
+      state.auth.authenticated = false;
+      state.users = [];
+      stopPolling();
+      showAuth(true);
+      toast("已退出登录", "success", 1800);
+    });
+  }
+
+  function renderAccount() {
+    var box = $("#accountInfo");
+    if (!box) return;
+    var rows = [
+      ["当前账号", state.auth.username || "-"],
+      ["角色", state.auth.role === "admin" ? "管理员" : "普通用户"],
+      ["登录状态", state.auth.authenticated ? "已登录" : "未登录"],
+      ["账号文件", state.auth.authFile || "-"]
+    ];
+    box.innerHTML = rows.map(function (r) {
+      return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[1]) + '">' + esc(r[1]) + '</span></div>';
+    }).join("");
+    var chip = $("#accountRole");
+    if (chip) {
+      chip.textContent = state.auth.role === "admin" ? "管理员" : "普通用户";
+      chip.className = "role-chip" + (state.auth.role === "admin" ? " admin" : "");
+    }
+    var path = $("#authFilePath");
+    if (path) path.textContent = state.auth.authFile || "users.json";
+    if (state.auth.isAdmin && state.tools && state.tools.identity_note) {
+      var note = $("#identityNote");
+      if (note) {
+        note.hidden = false;
+        note.textContent = "管理员来源：" + (state.tools.identity_note || "");
+      }
+    }
+  }
+
+  function renderUsers() {
+    var box = $("#userList");
+    if (!box) return;
+    var me = state.auth.username;
+    var html = state.users.map(function (u) {
+      var self = u.username === me;
+      return '<div class="user-row">' +
+        '<div class="user-main"><strong>' + esc(u.username) + '</strong>' +
+        '<span class="role-chip' + (u.role === "admin" ? " admin" : "") + '">' +
+        (u.role === "admin" ? "管理员" : "普通用户") + '</span>' +
+        '<span class="user-state' + (u.enabled ? " ok" : " off") + '">' +
+        (u.enabled ? "启用" : "已停用") + '</span>' +
+        (self ? '<span class="user-self">当前</span>' : '') + '</div>' +
+        '<div class="user-ops">' +
+        '<button class="btn ghost small" data-user-reset="' + esc(u.username) + '">重置密码</button>' +
+        '<button class="btn ghost small" data-user-toggle="' + esc(u.username) + '" data-enabled="' + (u.enabled ? "1" : "0") + '"' +
+        (self ? ' disabled title="不能停用当前账号"' : '') + '>' + (u.enabled ? "停用" : "启用") + '</button>' +
+        '<button class="btn danger small" data-user-delete="' + esc(u.username) + '"' +
+        (self ? ' disabled title="不能删除当前账号"' : '') + '>删除</button>' +
+        '</div></div>';
+    }).join("");
+    box.innerHTML = html || '<p class="hint">暂无用户</p>';
+  }
+
+  function loadUsers() {
+    if (!state.auth.isAdmin) return Promise.resolve();
+    return api("/api/users").then(function (data) {
+      state.users = (data && data.users) || [];
+      renderUsers();
+    }).catch(function (err) {
+      if (!err.unauthorized) toast("加载用户失败：" + err.message, "error", 6000);
+    });
+  }
+
+  function createUser() {
+    var username = ($("#newUserName").value || "").trim();
+    var password = $("#newUserPassword").value;
+    var role = $("#newUserRole").value;
+    if (!/^[A-Za-z0-9_.-]{2,32}$/.test(username)) {
+      toast("账号名需为 2-32 位字母、数字、下划线、点或短横线", "error", 5000);
+      return;
+    }
+    if (password.length < 8) {
+      toast("密码至少需要 8 个字符", "error", 5000);
+      return;
+    }
+    post("/api/users/create", { username: username, password: password, role: role })
+      .then(function () {
+        $("#newUserName").value = "";
+        $("#newUserPassword").value = "";
+        toast("用户已创建", "success", 2000);
+        loadUsers();
+      }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
+  function toggleUser(name, enabled) {
+    post("/api/users/update", { username: name, enabled: enabled })
+      .then(function () {
+        toast(enabled ? "已启用账号" : "已停用账号", "success", 2000);
+        loadUsers();
+      }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
+  function resetUserPassword(name) {
+    var password = window.prompt("为账号 " + name + " 设置新密码（至少 8 个字符）", "");
+    if (password === null) return;
+    if (password.length < 8) { toast("密码至少需要 8 个字符", "error", 5000); return; }
+    post("/api/users/password", { username: name, password: password })
+      .then(function () {
+        toast("密码已重置，该账号需重新登录", "success", 2600);
+        loadUsers();
+      }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
+  function deleteUser(name) {
+    if (!window.confirm("确定删除账号 " + name + "？该账号将立即失去登录权限。")) return;
+    post("/api/users/delete", { username: name })
+      .then(function () {
+        toast("账号已删除", "success", 2000);
+        loadUsers();
+      }).catch(function (err) { toast(err.message, "error", 6000); });
+  }
+
+  function applyAuthFromTools(tools) {
+    var t = tools || {};
+    if (t.username) state.auth.username = t.username;
+    if (t.role) state.auth.role = t.role;
+    state.auth.isAdmin = !!t.is_admin;
+    if (t.auth_file) state.auth.authFile = t.auth_file;
+    renderAccount();
+    var card = $("#usersCard");
+    if (card) card.hidden = !state.auth.isAdmin;
+    if (state.auth.isAdmin) loadUsers();
+  }
+
   function stopPolling() {
     clearInterval(state.taskTimer);
     state.taskTimer = null;
@@ -190,8 +481,13 @@
   }
 
   function startApp() {
+    state.auth.authenticated = true;
+    $("#authModal").hidden = true;
     loadTools()
-      .then(loadConfig)
+      .then(function (tools) {
+        applyAuthFromTools(tools);
+        return loadConfig();
+      })
       .then(loadFiles)
       .then(function () {
         processDefaults();
@@ -202,7 +498,7 @@
         updatePreviews();
       })
       .catch(function (err) {
-        toast("初始化失败：" + err.message, "error", 8000);
+        if (!err || !err.unauthorized) toast("初始化失败：" + err.message, "error", 8000);
       });
     loadTasks(true);
     stopPolling();
@@ -1294,6 +1590,24 @@
         loadFiles();
       }).catch(function (err) { toast(err.message, "error", 6000); });
     });
+    $("#authLogout").addEventListener("click", logout);
+    $("#usersRefresh").addEventListener("click", function () { loadUsers(); });
+    $("#newUserCreate").addEventListener("click", createUser);
+    $("#newUserPassword").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); createUser(); }
+    });
+    $("#userList").addEventListener("click", function (e) {
+      var reset = e.target.closest("[data-user-reset]");
+      if (reset) { resetUserPassword(reset.getAttribute("data-user-reset")); return; }
+      var toggle = e.target.closest("[data-user-toggle]");
+      if (toggle) {
+        toggleUser(toggle.getAttribute("data-user-toggle"),
+                   toggle.getAttribute("data-enabled") !== "1");
+        return;
+      }
+      var del = e.target.closest("[data-user-delete]");
+      if (del) deleteUser(del.getAttribute("data-user-delete"));
+    });
   }
 
   function bindAbout() {
@@ -1339,6 +1653,7 @@
     $$(".modal-backdrop").forEach(function (backdrop) {
       backdrop.addEventListener("mousedown", function (e) {
         if (e.target !== backdrop) return;
+        if (backdrop.id === "authModal") return;
         if (backdrop.id === "logModal") closeLog();
         else backdrop.hidden = true;
       });
@@ -1376,12 +1691,13 @@
     bindPicker();
     bindLog();
     bindGlobal();
+    $("#authForm").addEventListener("submit", submitAuth);
 
     var initial = (window.location.hash || "").replace(/^#/, "");
     setView(VIEW_META[initial] ? initial : "merge");
 
     updateConvertCopyState();
-    startApp();
+    checkAuth();
   }
 
   if (document.readyState === "loading") {

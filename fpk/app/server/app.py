@@ -9,10 +9,13 @@
 """
 import argparse
 import codecs
+import hashlib
+import hmac
 import html as html_lib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -31,7 +34,7 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -43,7 +46,17 @@ UPDATE_LOCK = threading.Lock()
 
 PKGVAR = os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.expanduser("~"), ".video-tool")
 CONFIG_PATH = os.path.join(PKGVAR, "config.json")
+USERS_PATH = os.path.join(PKGVAR, "users.json")
+SESSIONS_PATH = os.path.join(PKGVAR, "sessions.json")
 LIST_DIR = os.path.join(PKGVAR, "lists")
+
+SESSION_COOKIE = "vt_session"
+SESSION_TTL_REMEMBER = 400 * 24 * 3600
+SESSION_TTL_BROWSER = 12 * 3600
+LOGIN_WINDOW = 300
+LOGIN_MAX_FAILS = 8
+PASSWORD_MIN = 8
+PASSWORD_MAX = 128
 
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv", ".webm", ".m4v",
               ".wmv", ".mpg", ".mpeg", ".3gp", ".m2ts", ".vob", ".ogv", ".rmvb")
@@ -103,6 +116,13 @@ FFMPEG_BIN = None
 FFPROBE_BIN = None
 FFMPEG_ERROR = ""
 ROOTS = []
+
+USERS = []
+USERS_LOCK = threading.RLock()
+SESSIONS = {}
+SESSIONS_LOCK = threading.RLock()
+LOGIN_FAILS = {}
+LOGIN_FAILS_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -336,6 +356,337 @@ def save_config():
             os.remove(tmp)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------
+# 账号与会话
+# --------------------------------------------------------------------------
+
+# fnOS（飞牛）第三方应用目前只能拿到 TRIM_APPDEST / TRIM_PKGVAR 等路径类环境变量，
+# 官方文档未提供“当前登录的飞牛账号”注入方式，应用网关也不下发用户身份请求头。
+# 因此不猜测主账号身份：应用内首次设置的管理员就是最高权限账号。
+FNOS_IDENTITY_SOURCE = "app-admin"
+FNOS_IDENTITY_NOTE = "fnOS 未向第三方应用提供当前登录账号（无相关环境变量或请求头），应用内管理员为最高权限"
+
+
+def _atomic_write_json(path, data):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _hash_password(password, salt=None, n=16384, r=8, p=1):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                            dklen=32, maxmem=64 * 1024 * 1024)
+    return {"algo": "scrypt", "n": n, "r": r, "p": p,
+            "salt": salt.hex(), "hash": digest.hex()}
+
+
+def _check_password(user, password):
+    try:
+        salt = bytes.fromhex(str(user.get("salt") or ""))
+        expected = str(user.get("hash") or "")
+        if not salt or not expected:
+            return False
+        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                                n=int(user.get("n") or 16384),
+                                r=int(user.get("r") or 8),
+                                p=int(user.get("p") or 1),
+                                dklen=len(bytes.fromhex(expected)),
+                                maxmem=64 * 1024 * 1024)
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError, OSError):
+        return False
+
+
+def normalize_username(value):
+    name = (value or "").strip()
+    if not re.match(r"^[A-Za-z0-9_.-]{2,32}$", name):
+        raise ValueError("账号名需为 2-32 位字母、数字、下划线、点或短横线")
+    return name.lower()
+
+
+def check_password_value(password):
+    if not isinstance(password, str):
+        password = ""
+    if len(password) < PASSWORD_MIN:
+        raise ValueError("密码至少需要 %d 个字符" % PASSWORD_MIN)
+    if len(password) > PASSWORD_MAX:
+        raise ValueError("密码不能超过 %d 个字符" % PASSWORD_MAX)
+    return password
+
+
+def load_users():
+    global USERS
+    with USERS_LOCK:
+        USERS = []
+    if os.environ.get("VT_RESET_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
+        for path in (USERS_PATH, SESSIONS_PATH):
+            try:
+                os.remove(path)
+                sys.stderr.write("access control: removed %s by VT_RESET_AUTH\n" % path)
+            except OSError:
+                pass
+        return
+    try:
+        with open(USERS_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return
+    items = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return
+    users = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("username") or "").strip()
+        if (not name or item.get("algo") != "scrypt"
+                or not item.get("salt") or not item.get("hash")):
+            continue
+        users.append({
+            "username": name,
+            "role": "admin" if item.get("role") == "admin" else "user",
+            "enabled": bool(item.get("enabled", True)),
+            "algo": "scrypt",
+            "n": int(item.get("n") or 16384),
+            "r": int(item.get("r") or 8),
+            "p": int(item.get("p") or 1),
+            "salt": str(item.get("salt")),
+            "hash": str(item.get("hash")),
+            "created": int(item.get("created") or 0),
+            "updated": int(item.get("updated") or 0),
+        })
+    with USERS_LOCK:
+        USERS = users
+
+
+def save_users():
+    with USERS_LOCK:
+        _atomic_write_json(USERS_PATH, {"version": 1, "users": USERS})
+
+
+def users_configured():
+    with USERS_LOCK:
+        return bool(USERS)
+
+
+def find_user(name):
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    with USERS_LOCK:
+        for user in USERS:
+            if user["username"] == target:
+                return user
+    return None
+
+
+def admin_count():
+    with USERS_LOCK:
+        return sum(1 for u in USERS if u.get("role") == "admin")
+
+
+def create_user(name, password, role="user", enabled=True):
+    username = normalize_username(name)
+    password = check_password_value(password)
+    with USERS_LOCK:
+        if any(u["username"] == username for u in USERS):
+            raise ValueError("账号已存在：%s" % username)
+        now = int(time.time())
+        user = {"username": username,
+                "role": "admin" if role == "admin" else "user",
+                "enabled": bool(enabled),
+                "created": now, "updated": now}
+        user.update(_hash_password(password))
+        USERS.append(user)
+        try:
+            save_users()
+        except OSError:
+            USERS.remove(user)
+            raise ValueError("保存账号失败，请检查配置目录权限")
+        return user
+
+
+def set_user_password(username, password):
+    password = check_password_value(password)
+    user = find_user(username)
+    if not user:
+        raise ValueError("账号不存在")
+    updated = _hash_password(password)
+    user.update(updated)
+    user["updated"] = int(time.time())
+    with USERS_LOCK:
+        try:
+            save_users()
+        except OSError:
+            raise ValueError("保存账号失败，请检查配置目录权限")
+    return user
+
+
+def _session_key(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def load_sessions():
+    global SESSIONS
+    data = {}
+    try:
+        with open(SESSIONS_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        data = {}
+    items = data.get("sessions") if isinstance(data, dict) else None
+    now = time.time()
+    sessions = {}
+    if isinstance(items, dict):
+        for key, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            exp = item.get("exp")
+            try:
+                exp = float(exp)
+            except (TypeError, ValueError):
+                continue
+            if exp <= now or not item.get("u"):
+                continue
+            sessions[key] = {"u": str(item.get("u")),
+                             "exp": exp,
+                             "remember": bool(item.get("remember", True))}
+    with SESSIONS_LOCK:
+        SESSIONS = sessions
+
+
+def save_sessions():
+    with SESSIONS_LOCK:
+        try:
+            _atomic_write_json(SESSIONS_PATH, {"version": 1, "sessions": SESSIONS})
+        except OSError:
+            pass
+
+
+def issue_session(username, remember):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    ttl = SESSION_TTL_REMEMBER if remember else SESSION_TTL_BROWSER
+    with SESSIONS_LOCK:
+        for key in [k for k, v in SESSIONS.items() if v.get("exp", 0) <= now]:
+            SESSIONS.pop(key, None)
+        SESSIONS[_session_key(token)] = {"u": username, "exp": now + ttl,
+                                        "remember": bool(remember)}
+    save_sessions()
+    return token
+
+
+def drop_session(token):
+    if not token:
+        return
+    with SESSIONS_LOCK:
+        if SESSIONS.pop(_session_key(token), None) is not None:
+            save_sessions()
+
+
+def drop_user_sessions(username, keep=None):
+    target = (username or "").strip().lower()
+    keep_key = _session_key(keep) if keep else None
+    with SESSIONS_LOCK:
+        keys = [k for k, v in SESSIONS.items()
+                if v.get("u") == target and k != keep_key]
+        for key in keys:
+            SESSIONS.pop(key, None)
+        if keys:
+            save_sessions()
+
+
+def cookie_value(raw, name):
+    for part in (raw or "").split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        if key == name:
+            return value.strip()
+    return ""
+
+
+def session_user(handler):
+    """返回当前请求对应的用户；顺带做会话滑动续期与账号启停校验。"""
+    token = cookie_value(handler.headers.get("Cookie", ""), SESSION_COOKIE)
+    if not token:
+        return None
+    key = _session_key(token)
+    now = time.time()
+    dirty = False
+    with SESSIONS_LOCK:
+        item = SESSIONS.get(key)
+        if not item or item.get("exp", 0) <= now:
+            if item:
+                SESSIONS.pop(key, None)
+                dirty = True
+            item = None
+        else:
+            ttl = SESSION_TTL_REMEMBER if item.get("remember") else SESSION_TTL_BROWSER
+            if item["exp"] - now < ttl / 2:
+                item["exp"] = now + ttl
+                dirty = True
+    if dirty:
+        save_sessions()
+    if not item:
+        return None
+    user = find_user(item.get("u"))
+    if not user or not user.get("enabled"):
+        drop_session(token)
+        return None
+    return dict(user)
+
+
+def login_fail_count(ip):
+    now = time.time()
+    with LOGIN_FAILS_LOCK:
+        items = [t for t in LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
+        LOGIN_FAILS[ip] = items
+        return len(items)
+
+
+def note_login_fail(ip):
+    with LOGIN_FAILS_LOCK:
+        LOGIN_FAILS.setdefault(ip, []).append(time.time())
+
+
+def clear_login_fail(ip):
+    with LOGIN_FAILS_LOCK:
+        LOGIN_FAILS.pop(ip, None)
+
+
+def make_session_cookie(token, max_age=None):
+    parts = ["%s=%s" % (SESSION_COOKIE, token), "Path=/", "HttpOnly", "SameSite=Lax"]
+    if max_age is not None:
+        parts.append("Max-Age=%d" % max_age)
+    return "; ".join(parts)
+
+
+def user_public(user):
+    return {"username": user["username"],
+            "role": user["role"],
+            "enabled": bool(user.get("enabled")),
+            "created": user.get("created") or 0,
+            "updated": user.get("updated") or 0}
 
 
 # --------------------------------------------------------------------------
@@ -1405,23 +1756,63 @@ class Handler(BaseHTTPRequestHandler):
     def query(self):
         return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
 
+    def current_user(self):
+        return session_user(self)
+
+    def _auth_guard(self, path):
+        """静态资源与登录/状态接口放行，其余 API 均需登录。"""
+        if not path.startswith("/api/"):
+            return True
+        open_paths = ("/api/auth/status", "/api/auth/setup",
+                      "/api/auth/login", "/api/auth/logout")
+        if path in open_paths:
+            return True
+        if self.current_user():
+            return True
+        self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
+        return False
+
+    def _require_admin(self):
+        user = self.current_user()
+        if not user:
+            self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
+            return None
+        if user.get("role") != "admin":
+            self.send_json({"error": "只有管理员可以管理用户", "code": "forbidden"}, 403)
+            return None
+        return user
+
     # ---------------- GET ----------------
 
     def do_GET(self):
         path = unquote(urlparse(self.path).path)
 
         try:
+            if not self._auth_guard(path):
+                return
             if path in ("/", "/index.html"):
                 self.send_file(os.path.join(UI_DIR, "index.html"))
+            elif path == "/api/auth/status":
+                self.api_auth_status()
+            elif path == "/api/users":
+                self.api_users()
             elif path == "/api/config":
                 self.api_config()
             elif path == "/api/tools":
+                user = self.current_user()
                 info = tool_info()
                 info.update({
                     "input_dir": INPUT_DIR,
                     "output_dir": OUTPUT_DIR,
                     "roots": ROOTS,
                     "pkgvar": PKGVAR,
+                    "auth_enabled": users_configured(),
+                    "auth_file": USERS_PATH,
+                    "username": user["username"] if user else "",
+                    "role": user["role"] if user else "",
+                    "is_admin": bool(user and user.get("role") == "admin"),
+                    "identity_source": FNOS_IDENTITY_SOURCE,
+                    "identity_note": FNOS_IDENTITY_NOTE,
                 })
                 self.send_json(info)
             elif path == "/api/update":
@@ -1444,6 +1835,28 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "not found"}, 404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
+
+    def api_auth_status(self):
+        user = self.current_user()
+        self.send_json({
+            "configured": users_configured(),
+            "authenticated": bool(user),
+            "setup_required": not users_configured(),
+            "password_min": PASSWORD_MIN,
+            "username": user["username"] if user else "",
+            "role": user["role"] if user else "",
+            "is_admin": bool(user and user.get("role") == "admin"),
+            "auth_file": USERS_PATH,
+            "identity_source": FNOS_IDENTITY_SOURCE,
+            "identity_note": FNOS_IDENTITY_NOTE,
+        })
+
+    def api_users(self):
+        if not self._require_admin():
+            return
+        with USERS_LOCK:
+            users = [user_public(u) for u in sorted(USERS, key=lambda x: x["username"])]
+        self.send_json({"users": users, "current": self.current_user()["username"]})
 
     def api_config(self):
         input_ok, input_error = dir_state(INPUT_DIR, False)
@@ -1663,7 +2076,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/config":
+            if not self._auth_guard(path):
+                return
+            if path == "/api/auth/setup":
+                self.api_auth_setup()
+            elif path == "/api/auth/login":
+                self.api_auth_login()
+            elif path == "/api/auth/logout":
+                self.api_auth_logout()
+            elif path == "/api/auth/password":
+                self.api_auth_password()
+            elif path == "/api/users/create":
+                self.api_user_create()
+            elif path == "/api/users/update":
+                self.api_user_update()
+            elif path == "/api/users/password":
+                self.api_user_password()
+            elif path == "/api/users/delete":
+                self.api_user_delete()
+            elif path == "/api/config":
                 self.api_save_config()
             elif path == "/api/checkdir":
                 self.api_checkdir()
@@ -1679,6 +2110,147 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, 400)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
+
+    def _session_saved(self, token, remember):
+        max_age = SESSION_TTL_REMEMBER if remember else None
+        return [("Set-Cookie", make_session_cookie(token, max_age))]
+
+    def api_auth_setup(self):
+        if users_configured():
+            self.send_json({"error": "管理员账号已设置，请直接登录", "code": "already_configured"}, 409)
+            return
+        data = self.read_json()
+        username = normalize_username(data.get("username") or "admin")
+        password = check_password_value(data.get("password"))
+        remember = bool(data.get("remember", True))
+        create_user(username, password, role="admin", enabled=True)
+        token = issue_session(username, remember)
+        self.send_json({"ok": True, "configured": True, "username": username,
+                        "role": "admin", "is_admin": True},
+                       extra_headers=self._session_saved(token, remember))
+
+    def api_auth_login(self):
+        if not users_configured():
+            self.send_json({"error": "尚未设置管理员账号", "code": "setup_required"}, 409)
+            return
+        ip = self.client_address[0]
+        if login_fail_count(ip) >= LOGIN_MAX_FAILS:
+            self.send_json({"error": "尝试次数过多，请稍后再试", "code": "too_many_attempts"},
+                           429, [("Retry-After", str(LOGIN_WINDOW))])
+            return
+        data = self.read_json()
+        username = (data.get("username") or "").strip().lower()
+        password = data.get("password")
+        if not isinstance(password, str):
+            password = ""
+        user = find_user(username)
+        if not user or not user.get("enabled") or not _check_password(user, password):
+            note_login_fail(ip)
+            time.sleep(0.35)
+            if user and not user.get("enabled"):
+                self.send_json({"error": "该账号已被停用", "code": "disabled"}, 403)
+            else:
+                self.send_json({"error": "账号或密码不正确", "code": "bad_password"}, 401)
+            return
+        clear_login_fail(ip)
+        remember = bool(data.get("remember", True))
+        token = issue_session(user["username"], remember)
+        self.send_json({"ok": True, "configured": True,
+                        "username": user["username"], "role": user["role"],
+                        "is_admin": user["role"] == "admin"},
+                       extra_headers=self._session_saved(token, remember))
+
+    def api_auth_logout(self):
+        drop_session(cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE))
+        self.send_json({"ok": True},
+                       extra_headers=[("Set-Cookie",
+                                       "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+                                       % SESSION_COOKIE)])
+
+    def api_auth_password(self):
+        user = self.current_user()
+        if not user:
+            self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
+            return
+        data = self.read_json()
+        set_user_password(user["username"], data.get("password"))
+        token = cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE)
+        drop_user_sessions(user["username"], keep=token)
+        self.send_json({"ok": True})
+
+    def api_user_create(self):
+        if not self._require_admin():
+            return
+        data = self.read_json()
+        username = normalize_username(data.get("username"))
+        password = check_password_value(data.get("password"))
+        role = "admin" if data.get("role") == "admin" else "user"
+        user = create_user(username, password, role=role, enabled=True)
+        self.send_json({"ok": True, "user": user_public(user)})
+
+    def api_user_update(self):
+        if not self._require_admin():
+            return
+        operator = self.current_user()
+        data = self.read_json()
+        username = (data.get("username") or "").strip().lower()
+        user = find_user(username)
+        if not user:
+            raise ValueError("账号不存在")
+        if "enabled" in data:
+            enabled = bool(data.get("enabled"))
+            if not enabled and user["username"] == operator["username"]:
+                raise ValueError("不能停用当前登录的管理员账号")
+            if (not enabled and user["role"] == "admin"
+                    and admin_count() <= 1):
+                raise ValueError("至少需要保留一个可用的管理员账号")
+            user["enabled"] = enabled
+        if "role" in data:
+            role = "admin" if data.get("role") == "admin" else "user"
+            if (role != "admin" and user["role"] == "admin"
+                    and (user["username"] == operator["username"] or admin_count() <= 1)):
+                raise ValueError("不能降级当前账号或最后一个管理员")
+            user["role"] = role
+        user["updated"] = int(time.time())
+        try:
+            save_users()
+        except OSError:
+            raise ValueError("保存账号失败，请检查配置目录权限")
+        if not user.get("enabled"):
+            drop_user_sessions(user["username"])
+        self.send_json({"ok": True, "user": user_public(user)})
+
+    def api_user_password(self):
+        if not self._require_admin():
+            return
+        data = self.read_json()
+        username = (data.get("username") or "").strip().lower()
+        set_user_password(username, data.get("password"))
+        drop_user_sessions(username)
+        self.send_json({"ok": True})
+
+    def api_user_delete(self):
+        if not self._require_admin():
+            return
+        operator = self.current_user()
+        data = self.read_json()
+        username = (data.get("username") or "").strip().lower()
+        if username == operator["username"]:
+            raise ValueError("不能删除当前登录的管理员账号")
+        with USERS_LOCK:
+            target = next((u for u in USERS if u["username"] == username), None)
+            if not target:
+                raise ValueError("账号不存在")
+            if target["role"] == "admin" and admin_count() <= 1:
+                raise ValueError("至少需要保留一个管理员账号")
+            USERS.remove(target)
+            try:
+                save_users()
+            except OSError:
+                USERS.append(target)
+                raise ValueError("保存账号失败，请检查配置目录权限")
+        drop_user_sessions(username)
+        self.send_json({"ok": True})
 
     def api_save_config(self):
         global INPUT_DIR, OUTPUT_DIR
@@ -1847,6 +2419,8 @@ def main():
     args = parser.parse_args()
 
     load_config()
+    load_users()
+    load_sessions()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
 

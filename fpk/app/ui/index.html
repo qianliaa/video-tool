@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.4.0">
+<link rel="stylesheet" href="style.css?v=1.5.0">
 </head>
 <body>
 <div class="app">
@@ -568,6 +568,50 @@
         </div>
       </div>
 
+      <div class="card settings-more" id="accountCard">
+        <div class="card-head">
+          <h2>账号</h2>
+          <span class="role-chip" id="accountRole">-</span>
+        </div>
+        <div class="kv" id="accountInfo"></div>
+        <p class="hint" id="identityNote" hidden></p>
+        <div class="account-actions">
+          <button class="btn danger small" id="authLogout">退出登录</button>
+        </div>
+        <div class="notice">
+          <strong>忘记密码</strong>
+          <p>停止应用后删除配置目录中的 <code id="authFilePath">users.json</code> 与 <code>sessions.json</code>，重新启动即可重新设置管理员；或在启动前设置环境变量 <code>VT_RESET_AUTH=1</code>。</p>
+        </div>
+      </div>
+
+      <div class="card settings-more" id="usersCard" hidden>
+        <div class="card-head">
+          <h2>用户管理</h2>
+          <button class="btn ghost small" id="usersRefresh">刷新</button>
+        </div>
+        <div class="user-list" id="userList"></div>
+        <h3 class="sub-title">新增用户</h3>
+        <div class="form-grid">
+          <div class="field">
+            <label for="newUserName">账号名</label>
+            <input id="newUserName" type="text" placeholder="例如 viewer" maxlength="32" spellcheck="false" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="newUserPassword">密码</label>
+            <input id="newUserPassword" type="password" placeholder="至少 8 个字符" maxlength="128" autocomplete="new-password">
+          </div>
+          <div class="field">
+            <label for="newUserRole">角色</label>
+            <select id="newUserRole">
+              <option value="user">普通用户</option>
+              <option value="admin">管理员</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn primary block" id="newUserCreate">新增用户</button>
+        <p class="hint">账号名支持 2-32 位字母、数字、下划线、点或短横线。普通用户可使用下载与处理功能，但看不到用户管理；管理员不能删除自己。</p>
+      </div>
+
       <div class="card settings-more">
         <div class="card-head"><h2>关于与更新</h2></div>
         <div class="kv" id="aboutInfo"></div>
@@ -638,6 +682,32 @@
 
 <div class="toasts" id="toasts"></div>
 
+<!-- 登录 / 首次设置 -->
+<div class="modal-backdrop" id="authModal" hidden>
+  <div class="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="modal-head">
+      <div>
+        <h2 id="authTitle">登录</h2>
+        <p class="log-sub" id="authDesc">请输入账号与密码</p>
+      </div>
+    </div>
+    <form id="authForm">
+      <div class="field">
+        <label for="authUsername">账号</label>
+        <input id="authUsername" type="text" autocomplete="username" placeholder="admin" maxlength="32" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="authPassword">密码</label>
+        <input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128" placeholder="至少 8 个字符" required>
+      </div>
+      <label class="check-row"><input id="authRemember" type="checkbox" checked> 记住我（关闭浏览器后仍保持登录）</label>
+      <p class="auth-error" id="authError" hidden></p>
+      <button class="btn primary block" id="authSubmit" type="submit">登录</button>
+    </form>
+    <p class="auth-hint" id="authHint">忘记密码？停止应用后删除配置目录中的 users.json 与 sessions.json，或启动前设置环境变量 VT_RESET_AUTH=1，重新启动后即可重新设置管理员。</p>
+  </div>
+</div>
+
 <!-- 目录选择 -->
 <div class="modal-backdrop" id="pickerModal" hidden>
   <div class="modal">
@@ -686,6 +756,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.4.0"></script>
+<script src="app.js?v=1.5.0"></script>
 </body>
 </html>
