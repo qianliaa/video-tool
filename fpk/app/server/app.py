@@ -31,7 +31,7 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.4.0"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -709,6 +709,11 @@ def build_ffmpeg(action, p):
             raise ValueError("至少选择 2 个文件")
         paths = [input_path(f) for f in files]
         out = output_path(p.get("output"), ".mkv")
+        base, ext = os.path.splitext(out)
+        index = 1
+        while os.path.exists(out):
+            out = "%s (%d)%s" % (base, index, ext)
+            index += 1
         os.makedirs(LIST_DIR, exist_ok=True)
         listfile = os.path.join(LIST_DIR, uuid.uuid4().hex + ".txt")
         with open(listfile, "w", encoding="utf-8") as fp:

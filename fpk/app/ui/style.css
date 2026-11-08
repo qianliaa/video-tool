@@ -501,6 +501,7 @@ textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-h
 
 .input-with-btn { display: flex; gap: 8px; }
 .input-with-btn input { flex: 1; }
+.input-with-btn select { width: auto; flex: 0 0 auto; min-width: 132px; }
 
 .search {
   width: 200px;

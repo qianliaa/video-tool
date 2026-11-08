@@ -72,7 +72,7 @@
 python pack.py
 ```
 
-输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.3.9.fpk`），在飞牛应用中心手动安装即可。
+输出 `video-tool-<版本>.fpk`（版本取自 `fpk/manifest` 的 `version`，例如 `video-tool-1.4.0.fpk`），在飞牛应用中心手动安装即可。
 
 打包脚本会：
 

@@ -14,6 +14,8 @@
     tools: {},
     files: [],
     merge: [],
+    mergeNameMode: "manual",
+    mergeNamePath: "",
     view: "merge",
     processSub: "convert",
     convertExt: "mp4",
@@ -113,6 +115,37 @@
   function extOf(path) {
     var m = String(path || "").match(/\.([^.]+)$/);
     return m ? m[1].toLowerCase() : "";
+  }
+
+  function sanitizeFileName(name) {
+    return String(name || "")
+      .replace(/[<>:"\/\\|?*\u0000-\u001f]/g, "_")
+      .replace(/\s+/g, " ")
+      .replace(/^[.\s]+|[.\s]+$/g, "")
+      .replace(/_{2,}/g, "_");
+  }
+
+  function mergeNameFrom(path) {
+    var value = sanitizeFileName(stem(path));
+    return (value || "merged") + ".mp4";
+  }
+
+  function mergeCommonName(paths) {
+    var stems = paths.map(function (p) { return sanitizeFileName(stem(p)) || "merged"; });
+    if (!stems.length) return "";
+    var prefix = stems[0];
+    for (var i = 1; i < stems.length; i++) {
+      var j = 0;
+      while (j < prefix.length && j < stems[i].length &&
+             prefix.charAt(j).toLowerCase() === stems[i].charAt(j).toLowerCase()) {
+        j++;
+      }
+      prefix = prefix.slice(0, j);
+    }
+    prefix = prefix.replace(/[\s._\-]+$/, "");
+    if (prefix.length < 2) prefix = stems[0];
+    prefix = sanitizeFileName(prefix) || "merged";
+    return prefix + ".mp4";
   }
 
   function joinOut(name) {
@@ -360,8 +393,6 @@
       esc(t.project_url || "https://github.com/qianliaa/video-tool") +
       '" target="_blank" rel="noopener noreferrer">github.com/qianliaa/video-tool</a></span>';
     box.appendChild(linkRow);
-    if ($("#aboutPublisher")) $("#aboutPublisher").textContent = t.publisher || "千里";
-    if ($("#aboutDeveloper")) $("#aboutDeveloper").textContent = t.developer || "千里";
   }
 
   // ---------------------------------------------------------------- 检查更新
@@ -534,6 +565,7 @@
     });
     $("#mergeSelCount").textContent = state.merge.length;
     $("#mergeSelEmpty").hidden = state.merge.length > 0;
+    updateMergeNameReference();
   }
 
   function moveMerge(idx, delta) {
@@ -543,6 +575,55 @@
     state.merge.splice(to, 0, item);
     renderMergeFiles();
     renderMergeSelected();
+  }
+
+  function syncMergeNameSelect() {
+    var sel = $("#mergeNameFrom");
+    if (!sel) return;
+    var value = state.mergeNameMode === "file"
+      ? "file:" + state.mergeNamePath : state.mergeNameMode;
+    var html = '<option value="manual">手动输入</option>' +
+      '<option value="common">公共部分</option>';
+    state.merge.forEach(function (path) {
+      var f = mergeFileByPath(path);
+      html += '<option value="file:' + esc(path) + '">文件名：' +
+        esc(f ? (f.name || baseName(path)) : baseName(path)) + "</option>";
+    });
+    sel.innerHTML = html;
+    sel.value = value;
+    if (!sel.value) {
+      state.mergeNameMode = "manual";
+      state.mergeNamePath = "";
+      sel.value = "manual";
+    }
+  }
+
+  function applyMergeNameReference() {
+    if (state.mergeNameMode === "manual") return;
+    var value = "";
+    if (state.mergeNameMode === "file") {
+      if (state.merge.indexOf(state.mergeNamePath) >= 0) {
+        value = mergeNameFrom(state.mergeNamePath);
+      }
+    } else if (state.merge.length) {
+      value = mergeCommonName(state.merge);
+    }
+    if (!value) return;
+    var input = $("#mergeOutput");
+    if (input) input.value = value;
+    updatePreviews();
+  }
+
+  function updateMergeNameReference() {
+    if (state.mergeNameMode === "file" && state.merge.indexOf(state.mergeNamePath) < 0) {
+      state.mergeNameMode = "common";
+      state.mergeNamePath = "";
+    }
+    if (state.mergeNameMode === "common" && !state.merge.length) {
+      state.mergeNameMode = "manual";
+    }
+    syncMergeNameSelect();
+    applyMergeNameReference();
   }
 
   function populateSelects() {
@@ -1079,7 +1160,28 @@
       renderMergeSelected();
     });
     $("#mergeRun").addEventListener("click", runMerge);
-    $("#mergeOutput").addEventListener("input", updatePreviews);
+    $("#mergeOutput").addEventListener("input", function () {
+      if (state.mergeNameMode !== "manual") {
+        state.mergeNameMode = "manual";
+        state.mergeNamePath = "";
+        syncMergeNameSelect();
+      }
+      updatePreviews();
+    });
+    $("#mergeNameFrom").addEventListener("change", function () {
+      var value = this.value || "manual";
+      if (value === "manual" || value === "common") {
+        state.mergeNameMode = value;
+        state.mergeNamePath = "";
+      } else if (value.indexOf("file:") === 0) {
+        state.mergeNameMode = "file";
+        state.mergeNamePath = value.slice(5);
+      } else {
+        state.mergeNameMode = "manual";
+        state.mergeNamePath = "";
+      }
+      updateMergeNameReference();
+    });
   }
 
   function bindProcess() {
