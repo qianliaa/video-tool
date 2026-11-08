@@ -26,15 +26,7 @@
     logId: null,
     logTimer: null,
     taskTimer: null,
-    updateBusy: false,
-    notify: {
-      channels: [],
-      options: { heartbeat_interval: 300, min_interval: 5 },
-      types: [],
-      events: [],
-      loaded: false,
-      busy: false
-    }
+    updateBusy: false
   };
 
   var VIEW_META = {
@@ -66,22 +58,6 @@
   };
 
   var STATUS_LABEL = { running: "运行中", done: "已完成", failed: "失败", canceled: "已取消" };
-
-  var NOTIFY_TYPES = [
-    ["wecom", "企业微信群机器人"],
-    ["feishu", "飞书群机器人"],
-    ["dingtalk", "钉钉群机器人"],
-    ["generic", "通用 Webhook"]
-  ];
-
-  var NOTIFY_EVENTS = [
-    ["task_start", "任务开始"],
-    ["task_done", "任务完成"],
-    ["task_failed", "任务失败"],
-    ["download_reconnect", "下载重连"],
-    ["download_interrupted", "下载中断"],
-    ["heartbeat", "服务自检异常"]
-  ];
 
   // ---------------------------------------------------------------- 基础
 
@@ -196,7 +172,6 @@
         toast("初始化失败：" + err.message, "error", 8000);
       });
     loadTasks(true);
-    loadNotify(true);
     stopPolling();
     state.taskTimer = setInterval(function () {
       if (!document.hidden) loadTasks(true);
@@ -252,11 +227,7 @@
       }
     } catch (e) {}
     if (name === "tasks") loadTasks(true);
-    if (name === "settings") {
-      renderToolInfo();
-      renderNotify();
-      if (!state.notify.loaded) loadNotify(true);
-    }
+    if (name === "settings") renderToolInfo();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -441,320 +412,6 @@
     }).then(function () {
       state.updateBusy = false;
       if (btn) btn.disabled = false;
-    });
-  }
-
-  // ---------------------------------------------------------------- 通知
-
-  function notifyTypeOpts(selected) {
-    var types = state.notify.types.length ? state.notify.types : NOTIFY_TYPES.map(function (t) {
-      return { id: t[0], name: t[1] };
-    });
-    return types.map(function (t) {
-      return '<option value="' + esc(t.id) + '"' + (t.id === selected ? " selected" : "") +
-        ">" + esc(t.name) + "</option>";
-    }).join("");
-  }
-
-  function notifyEventList() {
-    if (state.notify.events.length) return state.notify.events;
-    return NOTIFY_EVENTS.map(function (e) { return { id: e[0], name: e[1] }; });
-  }
-
-  function applyNotify(data) {
-    data = data || {};
-    var channels = Array.isArray(data.channels) ? data.channels : [];
-    state.notify.channels = channels.map(function (ch) {
-      return {
-        id: ch.id || "",
-        type: ch.type || "wecom",
-        name: ch.name || "",
-        url: ch.url || "",
-        secret: ch.secret || "",
-        msgtype: ch.msgtype || "markdown",
-        headers: ch.headers || {},
-        template: ch.template || "",
-        events: ch.events || [],
-        enabled: ch.enabled !== false
-      };
-    });
-    if (data.options) state.notify.options = data.options;
-    if (Array.isArray(data.types) && data.types.length) state.notify.types = data.types;
-    if (Array.isArray(data.events) && data.events.length) state.notify.events = data.events;
-    state.notify.loaded = true;
-  }
-
-  function loadNotify(silent) {
-    return api("/api/notify").then(function (data) {
-      applyNotify(data);
-      renderNotify();
-      return data;
-    }).catch(function (err) {
-      if (!silent) toast("读取通知设置失败：" + err.message, "error", 6000);
-    });
-  }
-
-  function channelMarkup(ch) {
-    var events = ch.events || [];
-    var eventButtons = notifyEventList().map(function (e) {
-      return '<button type="button" data-event="' + esc(e.id) + '"' +
-        (events.indexOf(e.id) >= 0 ? ' class="active"' : "") + ">" + esc(e.name) + "</button>";
-    }).join("");
-    var headersText = JSON.stringify(ch.headers || {}, null, 2);
-    return '<div class="notify-channel-head">' +
-        '<div class="notify-channel-title">' +
-          '<select data-field="type">' + notifyTypeOpts(ch.type) + "</select>" +
-          '<input type="text" data-field="name" placeholder="渠道名称" value="' + esc(ch.name) + '">' +
-        "</div>" +
-        '<label class="switch-row compact inline notify-enable"><input type="checkbox" data-field="enabled"' +
-          (ch.enabled ? " checked" : "") +
-          '><span class="switch"></span><div><strong>启用</strong></div></label>' +
-        '<button type="button" class="btn danger small" data-act="remove">删除</button>' +
-      "</div>" +
-      '<div class="form-grid">' +
-        '<div class="field">' +
-          '<label>Webhook 地址</label>' +
-          '<div class="input-with-btn">' +
-            '<input type="password" data-field="url" autocomplete="off" spellcheck="false" placeholder="https://…" value="' + esc(ch.url) + '">' +
-            '<button type="button" class="btn ghost small" data-act="reveal">显示</button>' +
-          "</div>" +
-          '<p class="hint">企业微信 / 飞书 / 钉钉请粘贴完整的机器人 Webhook 地址。</p>' +
-        "</div>" +
-        '<div class="field" data-show="wecom,dingtalk">' +
-          '<label>消息格式</label>' +
-          '<select data-field="msgtype">' +
-            '<option value="markdown"' + (ch.msgtype !== "text" ? " selected" : "") + ">Markdown</option>" +
-            '<option value="text"' + (ch.msgtype === "text" ? " selected" : "") + ">纯文本</option>" +
-          "</select>" +
-        "</div>" +
-      "</div>" +
-      '<div class="field" data-show="dingtalk">' +
-        '<label>加签密钥（钉钉机器人「加签」生成的 secret，可选）</label>' +
-        '<div class="input-with-btn">' +
-          '<input type="password" data-field="secret" autocomplete="off" spellcheck="false" placeholder="SEC…" value="' + esc(ch.secret) + '">' +
-          '<button type="button" class="btn ghost small" data-act="reveal">显示</button>' +
-        "</div>" +
-      "</div>" +
-      '<div class="field" data-show="generic">' +
-        '<label>自定义请求头（JSON 对象，可选）</label>' +
-        '<textarea data-field="headers" rows="2" spellcheck="false" placeholder=\'{"Authorization": "Bearer xxx"}\'>' + esc(headersText) + "</textarea>" +
-      "</div>" +
-      '<div class="field" data-show="generic">' +
-        '<label>请求体模板（可选，留空发送默认 JSON）</label>' +
-        '<textarea data-field="template" rows="3" spellcheck="false" placeholder=\'{"event":"{{event}}","text":"{{message}}"}\'>' + esc(ch.template) + "</textarea>" +
-        '<p class="hint">支持占位符 <code>{{title}}</code> <code>{{message}}</code> <code>{{event}}</code> <code>{{time}}</code>；以 { 开头时按 JSON 发送。</p>' +
-      "</div>" +
-      '<div class="field">' +
-        '<label>通知事件</label>' +
-        '<div class="chips pick event-chips">' + eventButtons + "</div>" +
-      "</div>" +
-      '<div class="notify-test-row">' +
-        '<button type="button" class="btn ghost small" data-act="test">发送测试</button>' +
-        '<span class="notify-test-result">测试会立即发送一条消息，失败会显示具体原因</span>' +
-      "</div>";
-  }
-
-  function updateChannelVisibility(card) {
-    if (!card) return;
-    var typeEl = card.querySelector('[data-field="type"]');
-    var type = typeEl ? typeEl.value : "wecom";
-    $$("[data-show]", card).forEach(function (el) {
-      var allowed = (el.getAttribute("data-show") || "").split(",");
-      el.hidden = allowed.indexOf(type) < 0;
-    });
-  }
-
-  function updateNotifyCount() {
-    var n = $$("#notifyList .notify-channel").length;
-    var count = $("#notifyCount");
-    if (count) count.textContent = n;
-    var empty = $("#notifyEmpty");
-    if (empty) empty.hidden = n > 0;
-  }
-
-  function renderNotify() {
-    var box = $("#notifyList");
-    if (!box) return;
-    box.innerHTML = "";
-    state.notify.channels.forEach(function (ch) {
-      var card = document.createElement("div");
-      card.className = "notify-channel";
-      if (ch.id) card.setAttribute("data-id", ch.id);
-      card.innerHTML = channelMarkup(ch);
-      box.appendChild(card);
-      updateChannelVisibility(card);
-    });
-    updateNotifyCount();
-  }
-
-  function readChannel(card) {
-    var field = function (name) { return card.querySelector('[data-field="' + name + '"]'); };
-    var typeEl = field("type");
-    var type = typeEl ? typeEl.value : "wecom";
-    var events = $$("[data-event]", card).filter(function (b) {
-      return b.classList.contains("active");
-    }).map(function (b) { return b.getAttribute("data-event"); });
-
-    var headers = {};
-    var headersEl = field("headers");
-    if (headersEl && headersEl.value.trim()) {
-      try {
-        headers = JSON.parse(headersEl.value);
-      } catch (e) {
-        throw new Error("自定义请求头必须是合法的 JSON 对象");
-      }
-      if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
-        throw new Error("自定义请求头必须是 JSON 对象");
-      }
-    }
-    var secretEl = field("secret");
-    var msgtypeEl = field("msgtype");
-    var templateEl = field("template");
-    return {
-      id: card.getAttribute("data-id") || "",
-      type: type,
-      name: field("name") ? field("name").value.trim() : "",
-      url: field("url") ? field("url").value.trim() : "",
-      secret: secretEl ? secretEl.value.trim() : "",
-      msgtype: msgtypeEl ? msgtypeEl.value : "markdown",
-      headers: headers,
-      template: templateEl ? templateEl.value.trim() : "",
-      events: events,
-      enabled: field("enabled") ? field("enabled").checked : true
-    };
-  }
-
-  function setNotifyStatus(text, bad) {
-    var box = $("#notifyStatus");
-    if (!box) return;
-    box.textContent = text;
-    box.className = "notify-status" + (bad ? " bad" : "");
-  }
-
-  function addNotifyChannel() {
-    state.notify.channels.push({
-      id: "",
-      type: "wecom",
-      name: "企业微信群",
-      url: "",
-      secret: "",
-      msgtype: "markdown",
-      headers: {},
-      template: "",
-      events: ["task_done", "task_failed", "download_interrupted"],
-      enabled: true
-    });
-    renderNotify();
-  }
-
-  function saveNotify() {
-    if (state.notify.busy) return;
-    var channels = [];
-    try {
-      $$("#notifyList .notify-channel").forEach(function (card) {
-        channels.push(readChannel(card));
-      });
-    } catch (err) {
-      setNotifyStatus(err.message, true);
-      toast(err.message, "error", 6000);
-      return;
-    }
-    state.notify.busy = true;
-    setNotifyStatus("正在保存…");
-    post("/api/notify", { channels: channels, options: state.notify.options })
-      .then(function (data) {
-        applyNotify(data);
-        renderNotify();
-        setNotifyStatus("已保存 " + state.notify.channels.length + " 个渠道");
-        toast("通知设置已保存", "success");
-      })
-      .catch(function (err) {
-        setNotifyStatus("保存失败：" + err.message, true);
-        toast(err.message, "error", 8000);
-      })
-      .then(function () { state.notify.busy = false; });
-  }
-
-  function testChannel(card) {
-    if (!card) return;
-    var channel;
-    try {
-      channel = readChannel(card);
-    } catch (err) {
-      var boxErr = card.querySelector(".notify-test-result");
-      if (boxErr) {
-        boxErr.className = "notify-test-result bad";
-        boxErr.textContent = "配置不完整：" + err.message;
-      }
-      return;
-    }
-    var result = card.querySelector(".notify-test-result");
-    var btn = card.querySelector('[data-act="test"]');
-    if (btn) btn.disabled = true;
-    if (result) {
-      result.className = "notify-test-result";
-      result.textContent = "正在发送…";
-    }
-    post("/api/notify/test", { channel: channel }).then(function (data) {
-      if (!result) return;
-      if (data && data.ok) {
-        result.className = "notify-test-result ok";
-        result.textContent = "发送成功（HTTP " + (data.http_status || 200) + "，" +
-          (data.elapsed_ms || 0) + " ms）";
-        toast("测试消息已发送", "success");
-      } else {
-        var reason = (data && data.error) || "未知原因";
-        result.className = "notify-test-result bad";
-        result.textContent = "发送失败：" + reason + "（" + ((data && data.elapsed_ms) || 0) + " ms）";
-        toast("测试发送失败：" + reason, "error", 9000);
-      }
-    }).catch(function (err) {
-      if (!result) return;
-      result.className = "notify-test-result bad";
-      result.textContent = "发送失败：" + err.message;
-      toast("测试发送失败：" + err.message, "error", 9000);
-    }).then(function () {
-      if (btn) btn.disabled = false;
-    });
-  }
-
-  function bindNotify() {
-    if (!$("#notifyCard")) return;
-    $("#notifyAdd").addEventListener("click", addNotifyChannel);
-    $("#notifySave").addEventListener("click", saveNotify);
-    $("#notifyReload").addEventListener("click", function () { loadNotify(false); });
-
-    $("#notifyList").addEventListener("click", function (e) {
-      var eventBtn = e.target.closest("[data-event]");
-      if (eventBtn) {
-        eventBtn.classList.toggle("active");
-        return;
-      }
-      var reveal = e.target.closest('[data-act="reveal"]');
-      if (reveal) {
-        var input = reveal.parentNode.querySelector("input");
-        if (input) {
-          input.type = input.type === "password" ? "text" : "password";
-          reveal.textContent = input.type === "password" ? "显示" : "隐藏";
-        }
-        return;
-      }
-      var remove = e.target.closest('[data-act="remove"]');
-      if (remove) {
-        var card = remove.closest(".notify-channel");
-        if (card) {
-          card.remove();
-          updateNotifyCount();
-        }
-        return;
-      }
-      var test = e.target.closest('[data-act="test"]');
-      if (test) testChannel(test.closest(".notify-channel"));
-    });
-
-    $("#notifyList").addEventListener("change", function (e) {
-      var typeSel = e.target.closest('[data-field="type"]');
-      if (typeSel) updateChannelVisibility(typeSel.closest(".notify-channel"));
     });
   }
 
@@ -1613,7 +1270,6 @@
     bindAdvanced();
     bindTasks();
     bindSettings();
-    bindNotify();
     bindAbout();
     bindPicker();
     bindLog();
