@@ -10,14 +10,14 @@
 import argparse
 import codecs
 import hashlib
-import hmac
 import html as html_lib
+import ipaddress
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -34,7 +34,7 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.3"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -46,17 +46,11 @@ UPDATE_LOCK = threading.Lock()
 
 PKGVAR = os.environ.get("TRIM_PKGVAR") or os.path.join(os.path.expanduser("~"), ".video-tool")
 CONFIG_PATH = os.path.join(PKGVAR, "config.json")
-USERS_PATH = os.path.join(PKGVAR, "users.json")
-SESSIONS_PATH = os.path.join(PKGVAR, "sessions.json")
 LIST_DIR = os.path.join(PKGVAR, "lists")
-
-SESSION_COOKIE = "vt_session"
-SESSION_TTL_REMEMBER = 400 * 24 * 3600
-SESSION_TTL_BROWSER = 12 * 3600
-LOGIN_WINDOW = 300
-LOGIN_MAX_FAILS = 8
-PASSWORD_MIN = 8
-PASSWORD_MAX = 128
+# fnOS 在「应用 › 访问权限」变更授权目录时执行 config 流程，
+# config_callback 会把 TRIM_DATA_*_PATHS 落盘到这两个文件，供运行中的服务即时刷新。
+ACCESSIBLE_PATHS_FILE = os.path.join(PKGVAR, "accessible_paths")
+SHARE_PATHS_FILE = os.path.join(PKGVAR, "share_paths")
 
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv", ".webm", ".m4v",
               ".wmv", ".mpg", ".mpeg", ".3gp", ".m2ts", ".vob", ".ogv", ".rmvb")
@@ -109,23 +103,27 @@ MIME = {
 
 TASKS = {}
 TASKS_LOCK = threading.Lock()
+# 同时跑的 ffmpeg 任务上限。NAS 上多个 libx264 并发会打满 CPU/内存，
+# 超出的任务进入排队状态，可用环境变量 VT_MAX_TASKS 调整（1-8）。
+try:
+    MAX_CONCURRENT_TASKS = max(1, min(8, int(os.environ.get("VT_MAX_TASKS", "2"))))
+except ValueError:
+    MAX_CONCURRENT_TASKS = 2
+TASK_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
+# 下载是网络 IO，与 CPU 密集的转码分开排队；可用 VT_MAX_DOWNLOADS 调整（1-8）。
+try:
+    MAX_CONCURRENT_DOWNLOADS = max(1, min(8, int(os.environ.get("VT_MAX_DOWNLOADS", "3"))))
+except ValueError:
+    MAX_CONCURRENT_DOWNLOADS = 3
+DOWNLOAD_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
+# 请求体上界：避免超大/慢速 body 占满线程与内存。
+MAX_REQUEST_BYTES = 1 * 1024 * 1024
 
-INPUT_DIR = ""
-OUTPUT_DIR = ""
 FFMPEG_BIN = None
 FFPROBE_BIN = None
 FFMPEG_ERROR = ""
-ROOTS = []
 
-USERS = []
-USERS_LOCK = threading.RLock()
-SESSIONS = {}
-SESSIONS_LOCK = threading.RLock()
-LOGIN_FAILS = {}
-LOGIN_FAILS_LOCK = threading.Lock()
-
-ALLOW_REGISTER = True
-REGISTER_APPROVAL = False
+CONFIG_LOCK = threading.RLock()
 
 
 # --------------------------------------------------------------------------
@@ -234,81 +232,73 @@ def inside(path, base):
     return rp == rb or rp.startswith(rb + os.sep)
 
 
-def dir_state(path, write=False):
+def scope_text(state):
+    roots = (state or {}).get("roots") or []
+    return "、".join(roots) if roots else "（尚未授权任何目录）"
+
+
+OUT_OF_SCOPE_HINT = ("请先在 系统设置 › 应用 › 视频助手 › 访问权限 中授权该目录，"
+                     "授权后回到应用重新选择。")
+
+
+def within_user_root(state, path):
+    """所有路径必须落在 fnOS 授权目录内；realpath 后判断，拦截 .. 与符号链接。"""
+    return within_paths((state or {}).get("roots") or [], path)
+
+
+def within_paths(paths, path):
+    rp = real(path)
+    for root in paths or []:
+        rr = real(root)
+        if rp == rr or rp.startswith(rr + os.sep):
+            return True
+    return False
+
+
+def require_user_path(state, path, what="该路径"):
+    """服务端统一越界校验：realpath 解析 .. 与符号链接后再判断。"""
+    if not within_user_root(state, path):
+        raise ValueError("只能使用已授权目录：%s（%s 已越界）。%s"
+                         % (scope_text(state), what, OUT_OF_SCOPE_HINT))
+    return real(path)
+
+
+def is_blocked_app_dir(state, path):
+    """应用自身目录始终禁止，避免输入输出落进程序目录。"""
+    return bool(is_app_dir(path))
+
+
+def dir_state(path, write=False, state=None, enforce_scope=True):
     if not path:
         return False, "未设置"
     if not os.path.isdir(path):
         return False, "目录不存在"
-    if is_app_dir(path):
+    if enforce_scope and state and not within_user_root(state, path):
+        return False, "只能使用已授权目录：%s" % scope_text(state)
+    if is_blocked_app_dir(state, path):
         return False, "不能使用应用自身目录"
     flags = os.R_OK | os.X_OK | (os.W_OK if write else 0)
+    mode = "读写" if write else "读取"
     try:
         if not os.access(path, flags):
-            return False, "没有%s权限，请先在系统设置中授权该文件夹" % ("读写" if write else "读取")
+            return False, ("没有%s权限。请先在「系统设置 › 应用 › 视频助手 › 访问权限」"
+                           "把该文件夹授权给应用" % mode)
     except OSError:
         return False, "无法访问该目录"
     return True, ""
 
 
-def mount_points():
-    points = []
-    try:
-        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as fp:
-            for line in fp:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                mp = parts[1].replace("\\040", " ")
-                if not mp.startswith("/"):
-                    continue
-                if mp == "/" or mp.startswith(("/proc", "/sys", "/dev", "/run",
-                                               "/usr", "/etc", "/var", "/tmp", "/boot")):
-                    continue
-                points.append(mp)
-    except OSError:
-        pass
-    return points
+def detect_roots(extra=(), state=None):
+    return list((state or {}).get("roots") or [])
 
 
-def detect_roots():
-    roots = []
-    candidates = ["/mnt", "/media", "/home"]
-    candidates += mount_points()
-    try:
-        with os.scandir("/") as it:
-            for entry in it:
-                if re.match(r"^vol\d+$", entry.name, re.I):
-                    candidates.append(entry.path)
-    except OSError:
-        pass
-    for p in (INPUT_DIR, OUTPUT_DIR):
-        if p:
-            candidates.append(p)
-    for p in candidates:
-        if not p or not os.path.isdir(p):
-            continue
-        rp = real(p)
-        if is_app_dir(rp) or rp in roots:
-            continue
-        roots.append(rp)
-    return roots
+def add_root(state, path):
+    """根集合只由 fnOS 授权目录决定，浏览时不再动态扩张。"""
+    return real(path)
 
 
-def add_root(path):
-    rp = real(path)
-    if not rp or rp == os.sep:
-        return rp
-    if os.path.isdir(rp) and not is_app_dir(rp) and rp not in ROOTS:
-        ROOTS.append(rp)
-    return rp
-
-
-def within_roots(path):
-    rp = real(path)
-    for root in ROOTS:
-        if rp == root or rp.startswith(root + os.sep):
-            return True
-    return False
+def within_roots(state, path):
+    return within_user_root(state, path)
 
 
 def _as_bool(value, default):
@@ -325,144 +315,49 @@ def _as_bool(value, default):
     return default
 
 
-def load_config():
-    global INPUT_DIR, OUTPUT_DIR, ROOTS, ALLOW_REGISTER, REGISTER_APPROVAL
-    INPUT_DIR = ""
-    OUTPUT_DIR = ""
-    data = {}
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    ALLOW_REGISTER = _as_bool(data.get("allow_register"), True)
-    REGISTER_APPROVAL = _as_bool(data.get("register_approval"), False)
-    for key, write in (("input_dir", False), ("output_dir", True)):
-        value = data.get(key)
-        if not isinstance(value, str) or not value.strip():
-            continue
-        path = real(value)
-        if not os.path.isdir(path) or is_app_dir(path):
-            continue
-        if key == "input_dir":
-            INPUT_DIR = path
-        else:
-            OUTPUT_DIR = path
-
-    for d in (PKGVAR, LIST_DIR):
-        try:
-            os.makedirs(d, exist_ok=True)
-        except OSError:
-            pass
-    resolve_binaries()
-    ROOTS = detect_roots()
-
-
-def save_config():
-    data = {
-        "input_dir": INPUT_DIR,
-        "output_dir": OUTPUT_DIR,
-        "allow_register": bool(ALLOW_REGISTER),
-        "register_approval": bool(REGISTER_APPROVAL),
-    }
-    tmp = CONFIG_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fp:
-            json.dump(data, fp, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-
-
 # --------------------------------------------------------------------------
-# 账号与会话
+# 全局配置（无账号、无用户隔离）
 # --------------------------------------------------------------------------
+# 所有请求共享同一份状态：目录设置全局唯一，任务与日志也不再按账号隔离。
+# 可访问目录只来自 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」的授权列表，
+# config_callback 落盘后由 refresh_roots() 即时刷新，无需重启服务。
 
-# 飞牛 fnOS 身份通道（依据官方开发者文档与官方 Web API 文档）：
-# * 端口服务入口（app/ui/config 中的 protocol + port）与 NAS 登录态无关，不会携带用户身份；
-# * 统一网关入口（gatewayPrefix + gatewaySocket，Unix Socket）会先校验登录态，再注入
-#   X-Trim-Userid / X-Trim-Username / X-Trim-Isadmin 请求头；
-# * index.cgi 入口会校验登录态，但官方文档未承诺向 CGI 下发用户字段；
-# * 面板自身的用户管理 WebSocket API 需要 NAS 管理员 Token + 签名，第三方应用无法调用。
-# 本项目仍以端口服务分发，默认拿不到飞牛账号。探测层保留可复用读取逻辑：
-# 显式环境变量 VT_FNOS_USER / VT_FNOS_USERNAME（可配 VT_FNOS_ISADMIN），
-# 或来自本机回环代理的网关请求头。为防止公网直连伪造请求头，X-Trim-* 等身份头
-# 只在请求来源为本机回环、或显式设置 VT_FNOS_TRUST_HEADERS=1 时才被信任。
-FNOS_IDENTITY_NOTE_FALLBACK = (
-    "未能从飞牛 fnOS 获取当前登录账号：本应用使用端口服务入口，官方文档说明端口服务"
-    "与 NAS 登录态无关，不会下发 X-Trim-Userid / X-Trim-Username / X-Trim-Isadmin 等身份头；"
-    "因此按「首个完成注册的账号为主账号管理员」处理，其余注册账号为普通用户。"
-)
-LOOPBACK_ADDRS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
-FNOS_USER_ENV_KEYS = ("VT_FNOS_USER", "VT_FNOS_USERNAME", "FNOS_USERNAME")
-
-
-def _trust_proxy_headers():
-    return os.environ.get("VT_FNOS_TRUST_HEADERS", "").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
-def _identity_from_headers(handler):
-    """只在本机回环代理或显式信任时才读取网关身份头，避免公网伪造。"""
-    if handler is None:
-        return None
-    if not _trust_proxy_headers():
-        peer = handler.client_address[0] if handler.client_address else ""
-        if peer not in LOOPBACK_ADDRS:
-            return None
-    trim_user = (handler.headers.get("X-Trim-Username") or "").strip()
-    if trim_user:
-        uid = (handler.headers.get("X-Trim-Userid") or "").strip()
-        is_admin = (handler.headers.get("X-Trim-Isadmin") or "").strip().lower() in (
-            "1", "true", "yes")
-        return {"username": trim_user, "uid": uid, "is_admin": is_admin,
-                "source": "fnos-gateway-header", "detail": "X-Trim-Username/X-Trim-Userid/X-Trim-Isadmin"}
-    proxy_user = ((handler.headers.get("X-Forwarded-User") or "").strip()
-                  or (handler.headers.get("Remote-User") or "").strip())
-    if proxy_user:
-        return {"username": proxy_user, "uid": "", "is_admin": False,
-                "source": "trusted-proxy-header", "detail": "X-Forwarded-User/Remote-User"}
-    return None
+APP_STATE = {
+    "key": "global",
+    "lock": CONFIG_LOCK,
+    "dir": PKGVAR,
+    "config_path": CONFIG_PATH,
+    "username": "",
+    "display_name": "",
+    "role": "admin",
+    "is_admin": True,
+    "path_scope": "choose",
+    "allow_download": True,
+    "shared_input": "",
+    "shared_output": "",
+    "input_dir": "",
+    "output_dir": "",
+    "roots": [],
+    "base_roots": [],
+    "bootstrap_scope": False,
+}
 
 
-def detect_fnos_identity(handler=None):
-    """可复用的飞牛身份探测层：显式配置 > 本机可信代理请求头；无法确认时返回 None。"""
-    for key in FNOS_USER_ENV_KEYS:
-        value = (os.environ.get(key) or "").strip()
-        if not value:
-            continue
-        is_admin = os.environ.get("VT_FNOS_ISADMIN", "1").strip().lower() in (
-            "1", "true", "yes", "on")
-        return {"username": value, "uid": "", "is_admin": is_admin,
-                "source": "env:" + key, "detail": "显式环境变量"}
-    return _identity_from_headers(handler)
-
-
-def identity_note(identity):
-    if identity:
-        role = "管理员" if identity.get("is_admin") else "普通用户"
-        return "已识别飞牛账号 %s（%s，来源：%s）" % (
-            identity.get("username"), role, identity.get("source"))
-    return FNOS_IDENTITY_NOTE_FALLBACK
-
-
-def _atomic_write_json(path, data):
+def _atomic_write_json(path, data, mode=0o600):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as fp:
             json.dump(data, fp, ensure_ascii=False, indent=2)
         try:
-            os.chmod(tmp, 0o600)
+            os.chmod(tmp, mode)
         except OSError:
             pass
         os.replace(tmp, path)
         try:
-            os.chmod(path, 0o600)
+            os.chmod(path, mode)
         except OSError:
             pass
     except OSError:
@@ -473,355 +368,97 @@ def _atomic_write_json(path, data):
         raise
 
 
-def _hash_password(password, salt=None, n=16384, r=8, p=1):
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
-                            dklen=32, maxmem=64 * 1024 * 1024)
-    return {"algo": "scrypt", "n": n, "r": r, "p": p,
-            "salt": salt.hex(), "hash": digest.hex()}
-
-
-def _check_password(user, password):
+def _read_json(path):
     try:
-        salt = bytes.fromhex(str(user.get("salt") or ""))
-        expected = str(user.get("hash") or "")
-        if not salt or not expected:
-            return False
-        digest = hashlib.scrypt(password.encode("utf-8"), salt=salt,
-                                n=int(user.get("n") or 16384),
-                                r=int(user.get("r") or 8),
-                                p=int(user.get("p") or 1),
-                                dklen=len(bytes.fromhex(expected)),
-                                maxmem=64 * 1024 * 1024)
-        return hmac.compare_digest(digest.hex(), expected)
-    except (ValueError, TypeError, OSError):
-        return False
-
-
-def normalize_username(value):
-    name = (value or "").strip()
-    if not re.match(r"^[A-Za-z0-9_.-]{2,32}$", name):
-        raise ValueError("账号名需为 2-32 位字母、数字、下划线、点或短横线")
-    return name.lower()
-
-
-def check_password_value(password, username=""):
-    if not isinstance(password, str):
-        password = ""
-    if len(password) < PASSWORD_MIN:
-        raise ValueError("密码至少需要 %d 个字符" % PASSWORD_MIN)
-    if len(password) > PASSWORD_MAX:
-        raise ValueError("密码不能超过 %d 个字符" % PASSWORD_MAX)
-    if not re.search(r"[A-Za-z]", password) or not re.search(r"[0-9]", password):
-        raise ValueError("密码需同时包含字母和数字")
-    if username and password.strip().lower() == (username or "").strip().lower():
-        raise ValueError("密码不能与账号名相同")
-    return password
-
-
-def check_confirm(password, confirm, required=True):
-    if confirm is None and not required:
-        return password
-    if not isinstance(confirm, str) or confirm != password:
-        raise ValueError("两次输入的密码不一致")
-    return password
-
-
-def load_users():
-    global USERS
-    with USERS_LOCK:
-        USERS = []
-    if os.environ.get("VT_RESET_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
-        for path in (USERS_PATH, SESSIONS_PATH):
-            try:
-                os.remove(path)
-                sys.stderr.write("access control: removed %s by VT_RESET_AUTH\n" % path)
-            except OSError:
-                pass
-        return
-    try:
-        with open(USERS_PATH, "r", encoding="utf-8") as fp:
+        with open(path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        return
-    items = data.get("users") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return
-    users = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("username") or "").strip()
-        if (not name or item.get("algo") != "scrypt"
-                or not item.get("salt") or not item.get("hash")):
-            continue
-        users.append({
-            "username": name,
-            "role": "admin" if item.get("role") == "admin" else "user",
-            "enabled": bool(item.get("enabled", True)),
-            "approved": bool(item.get("approved", True)),
-            "primary": bool(item.get("primary", False)),
-            "created_via": str(item.get("created_via") or "admin"),
-            "fnos_uid": str(item.get("fnos_uid") or ""),
-            "fnos_username": str(item.get("fnos_username") or ""),
-            "algo": "scrypt",
-            "n": int(item.get("n") or 16384),
-            "r": int(item.get("r") or 8),
-            "p": int(item.get("p") or 1),
-            "salt": str(item.get("salt")),
-            "hash": str(item.get("hash")),
-            "created": int(item.get("created") or 0),
-            "updated": int(item.get("updated") or 0),
-        })
-    if any(u["role"] == "admin" for u in users) and not any(u["primary"] for u in users):
-        admins = sorted([u for u in users if u["role"] == "admin"],
-                        key=lambda u: u["created"] or 0)
-        admins[0]["primary"] = True
-    with USERS_LOCK:
-        USERS = users
+        return {}
 
 
-def save_users():
-    with USERS_LOCK:
-        _atomic_write_json(USERS_PATH, {"version": 1, "users": USERS})
+def _parse_env_paths(name):
+    raw = os.environ.get(name) or ""
+    sep = ";" if os.name == "nt" else ":"
+    return [p.strip() for p in raw.split(sep) if p.strip()]
 
 
-def users_configured():
-    with USERS_LOCK:
-        return bool(USERS)
-
-
-def find_user(name):
-    target = (name or "").strip().lower()
-    if not target:
+def _read_path_file(path):
+    if not os.path.isfile(path):
         return None
-    with USERS_LOCK:
-        for user in USERS:
-            if user["username"] == target:
-                return user
-    return None
-
-
-def admin_count():
-    with USERS_LOCK:
-        return sum(1 for u in USERS if u.get("role") == "admin")
-
-
-def primary_user():
-    with USERS_LOCK:
-        for user in USERS:
-            if user.get("primary"):
-                return dict(user)
-    return None
-
-
-def fnos_bound_user(uid, name):
-    uid = (uid or "").strip()
-    name = (name or "").strip().lower()
-    if not uid and not name:
-        return None
-    with USERS_LOCK:
-        for user in USERS:
-            if uid and user.get("fnos_uid") == uid:
-                return dict(user)
-            if name and (user.get("fnos_username") or "").lower() == name:
-                return dict(user)
-    return None
-
-
-def create_user(name, password, role="user", enabled=True, approved=True, primary=False,
-                created_via="admin", fnos_uid="", fnos_username=""):
-    username = normalize_username(name)
-    password = check_password_value(password, username)
-    with USERS_LOCK:
-        if any(u["username"] == username for u in USERS):
-            raise ValueError("账号已存在：%s" % username)
-        now = int(time.time())
-        user = {"username": username,
-                "role": "admin" if role == "admin" else "user",
-                "enabled": bool(enabled),
-                "approved": bool(approved),
-                "primary": bool(primary),
-                "created_via": created_via if created_via in ("setup", "register", "admin") else "admin",
-                "fnos_uid": (fnos_uid or "").strip(),
-                "fnos_username": (fnos_username or "").strip(),
-                "created": now, "updated": now}
-        user.update(_hash_password(password))
-        USERS.append(user)
-        try:
-            save_users()
-        except OSError:
-            USERS.remove(user)
-            raise ValueError("保存账号失败，请检查配置目录权限")
-        return user
-
-
-def set_user_password(username, password):
-    password = check_password_value(password, username)
-    user = find_user(username)
-    if not user:
-        raise ValueError("账号不存在")
-    updated = _hash_password(password)
-    user.update(updated)
-    user["updated"] = int(time.time())
-    with USERS_LOCK:
-        try:
-            save_users()
-        except OSError:
-            raise ValueError("保存账号失败，请检查配置目录权限")
-    return user
-
-
-def _session_key(token):
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def load_sessions():
-    global SESSIONS
-    data = {}
     try:
-        with open(SESSIONS_PATH, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except (OSError, ValueError):
-        data = {}
-    items = data.get("sessions") if isinstance(data, dict) else None
-    now = time.time()
-    sessions = {}
-    if isinstance(items, dict):
-        for key, item in items.items():
-            if not isinstance(item, dict):
-                continue
-            exp = item.get("exp")
-            try:
-                exp = float(exp)
-            except (TypeError, ValueError):
-                continue
-            if exp <= now or not item.get("u"):
-                continue
-            sessions[key] = {"u": str(item.get("u")),
-                             "exp": exp,
-                             "remember": bool(item.get("remember", True))}
-    with SESSIONS_LOCK:
-        SESSIONS = sessions
+        with open(path, "r", encoding="utf-8", errors="replace") as fp:
+            return [line.strip() for line in fp.read().splitlines() if line.strip()]
+    except OSError:
+        return None
 
 
-def save_sessions():
-    with SESSIONS_LOCK:
+def _authorized_paths():
+    """fnOS 为应用授权的目录（config_callback 落盘的文件优先）。"""
+    result = []
+    for file_path, env_name in ((ACCESSIBLE_PATHS_FILE, "TRIM_DATA_ACCESSIBLE_PATHS"),
+                                (SHARE_PATHS_FILE, "TRIM_DATA_SHARE_PATHS")):
+        values = _read_path_file(file_path)
+        if values is None:
+            values = _parse_env_paths(env_name)
+        result.extend(values)
+    return result
+
+
+def refresh_roots():
+    """每次请求重读授权目录，授权变更后无需重启服务。"""
+    roots = []
+    for p in _authorized_paths():
+        if not p:
+            continue
+        rp = real(p)
+        if not os.path.isdir(rp) or is_app_dir(rp) or rp in roots:
+            continue
+        roots.append(rp)
+    with CONFIG_LOCK:
+        APP_STATE["roots"] = roots
+        APP_STATE["base_roots"] = list(roots)
+        APP_STATE["bootstrap_scope"] = not roots
+    return roots
+
+
+def _valid_saved_dir(value, write):
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    path = real(value)
+    ok, _err = dir_state(path, write, None, enforce_scope=False)
+    if not ok or is_app_dir(path):
+        return ""
+    if not within_paths(APP_STATE["roots"], path):
+        return ""
+    return path
+
+
+def load_config():
+    for d in (PKGVAR, LIST_DIR):
         try:
-            _atomic_write_json(SESSIONS_PATH, {"version": 1, "sessions": SESSIONS})
+            os.makedirs(d, exist_ok=True)
         except OSError:
             pass
+    refresh_roots()
+    data = _read_json(CONFIG_PATH)
+    with CONFIG_LOCK:
+        APP_STATE["input_dir"] = _valid_saved_dir(data.get("input_dir"), False)
+        APP_STATE["output_dir"] = _valid_saved_dir(data.get("output_dir"), True)
 
 
-def issue_session(username, remember):
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    ttl = SESSION_TTL_REMEMBER if remember else SESSION_TTL_BROWSER
-    with SESSIONS_LOCK:
-        for key in [k for k, v in SESSIONS.items() if v.get("exp", 0) <= now]:
-            SESSIONS.pop(key, None)
-        SESSIONS[_session_key(token)] = {"u": username, "exp": now + ttl,
-                                        "remember": bool(remember)}
-    save_sessions()
-    return token
+def save_config():
+    with CONFIG_LOCK:
+        _atomic_write_json(CONFIG_PATH, {
+            "version": 5,
+            "input_dir": APP_STATE["input_dir"],
+            "output_dir": APP_STATE["output_dir"],
+        }, mode=0o600)
 
 
-def drop_session(token):
-    if not token:
-        return
-    with SESSIONS_LOCK:
-        if SESSIONS.pop(_session_key(token), None) is not None:
-            save_sessions()
-
-
-def drop_user_sessions(username, keep=None):
-    target = (username or "").strip().lower()
-    keep_key = _session_key(keep) if keep else None
-    with SESSIONS_LOCK:
-        keys = [k for k, v in SESSIONS.items()
-                if v.get("u") == target and k != keep_key]
-        for key in keys:
-            SESSIONS.pop(key, None)
-        if keys:
-            save_sessions()
-
-
-def cookie_value(raw, name):
-    for part in (raw or "").split(";"):
-        if "=" not in part:
-            continue
-        key, value = part.strip().split("=", 1)
-        if key == name:
-            return value.strip()
-    return ""
-
-
-def session_user(handler):
-    """返回当前请求对应的用户；顺带做会话滑动续期与账号启停校验。"""
-    token = cookie_value(handler.headers.get("Cookie", ""), SESSION_COOKIE)
-    if not token:
-        return None
-    key = _session_key(token)
-    now = time.time()
-    dirty = False
-    with SESSIONS_LOCK:
-        item = SESSIONS.get(key)
-        if not item or item.get("exp", 0) <= now:
-            if item:
-                SESSIONS.pop(key, None)
-                dirty = True
-            item = None
-        else:
-            ttl = SESSION_TTL_REMEMBER if item.get("remember") else SESSION_TTL_BROWSER
-            if item["exp"] - now < ttl / 2:
-                item["exp"] = now + ttl
-                dirty = True
-    if dirty:
-        save_sessions()
-    if not item:
-        return None
-    user = find_user(item.get("u"))
-    if not user or not user.get("enabled") or not user.get("approved", True):
-        drop_session(token)
-        return None
-    return dict(user)
-
-
-def login_fail_count(ip):
-    now = time.time()
-    with LOGIN_FAILS_LOCK:
-        items = [t for t in LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
-        LOGIN_FAILS[ip] = items
-        return len(items)
-
-
-def note_login_fail(ip):
-    with LOGIN_FAILS_LOCK:
-        LOGIN_FAILS.setdefault(ip, []).append(time.time())
-
-
-def clear_login_fail(ip):
-    with LOGIN_FAILS_LOCK:
-        LOGIN_FAILS.pop(ip, None)
-
-
-def make_session_cookie(token, max_age=None):
-    parts = ["%s=%s" % (SESSION_COOKIE, token), "Path=/", "HttpOnly", "SameSite=Lax"]
-    if max_age is not None:
-        parts.append("Max-Age=%d" % max_age)
-    return "; ".join(parts)
-
-
-def user_public(user):
-    return {"username": user["username"],
-            "role": user["role"],
-            "enabled": bool(user.get("enabled")),
-            "approved": bool(user.get("approved", True)),
-            "primary": bool(user.get("primary")),
-            "created_via": user.get("created_via") or "admin",
-            "fnos_username": user.get("fnos_username") or "",
-            "created": user.get("created") or 0,
-            "updated": user.get("updated") or 0}
+def init_app_state():
+    resolve_binaries()
+    load_config()
 
 
 # --------------------------------------------------------------------------
@@ -881,43 +518,75 @@ def safe_name(name, default_ext=".mkv"):
     return name
 
 
-def require_input_dir():
-    if not INPUT_DIR:
+def require_input_dir(state):
+    if not state["input_dir"]:
         raise ValueError("请先在设置中选择输入目录")
-    ok, err = dir_state(INPUT_DIR, False)
+    ok, err = dir_state(state["input_dir"], False, state)
     if not ok:
         raise ValueError("输入目录不可用：%s" % err)
 
 
-def require_output_dir():
-    if not OUTPUT_DIR:
+def require_output_dir(state):
+    if not state["output_dir"]:
         raise ValueError("请先在设置中选择输出目录")
-    ok, err = dir_state(OUTPUT_DIR, True)
+    ok, err = dir_state(state["output_dir"], True, state)
     if not ok:
         raise ValueError("输出目录不可用：%s" % err)
 
 
-def output_path(name, default_ext=".mkv"):
-    require_output_dir()
+OUTPUT_PATH_LOCK = threading.Lock()
+RESERVED_OUTPUTS = set()
+LAST_OUTPUT = threading.local()
+
+
+def release_output(path):
+    """任务结束后释放预占的输出路径。"""
+    if not path:
+        return
+    with OUTPUT_PATH_LOCK:
+        RESERVED_OUTPUTS.discard(path)
+
+
+def output_path(state, name, default_ext=".mkv"):
+    require_output_dir(state)
     name = safe_name(name, default_ext)
-    base = real(OUTPUT_DIR)
+    base = real(state["output_dir"])
     path = real(os.path.join(base, name))
     if path != base and not path.startswith(base + os.sep):
         raise ValueError("输出路径超出输出目录")
+    require_user_path(state, path, "输出路径")
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    # 统一防覆盖：ffmpeg 命令带 -y，若同名文件已存在会被静默覆盖。
+    # 并发提交时文件可能还没被创建，所以除了磁盘存在性还要看进程内预占集合。
+    # 所有动作一律自动追加 (1)/(2)，与合并页原有的命名行为保持一致。
+    with OUTPUT_PATH_LOCK:
+        if os.path.exists(path) or path in RESERVED_OUTPUTS:
+            stem, ext = os.path.splitext(path)
+            index = 1
+            while True:
+                candidate = "%s (%d)%s" % (stem, index, ext)
+                if not os.path.exists(candidate) and candidate not in RESERVED_OUTPUTS:
+                    break
+                index += 1
+                if index > 999:
+                    raise ValueError("同名输出文件过多，请先整理输出目录")
+            path = candidate
+        RESERVED_OUTPUTS.add(path)
+    LAST_OUTPUT.path = path
     return path
 
 
-def input_path(value):
+def input_path(state, value):
     if not value:
         raise ValueError("请选择输入文件")
-    require_input_dir()
-    base = real(INPUT_DIR)
+    require_input_dir(state)
+    base = real(state["input_dir"])
     path = real(value if os.path.isabs(value) else os.path.join(base, value))
     if not inside(path, base):
         raise ValueError("输入文件不在输入目录内")
+    require_user_path(state, path, "输入文件")
     if not os.path.isfile(path):
         raise ValueError("输入文件不存在：%s" % value)
     return path
@@ -1020,9 +689,13 @@ def log_line(task, line):
     if not line:
         return
     task["log"].append(line)
+    # log_seq 是单调递增的全局行号；log_start 记录当前数组第 0 行对应的行号，
+    # 前端用 ?since= 增量拉取时不会因为日志被截断而错位。
+    task["log_seq"] = task.get("log_seq", 0) + 1
     if len(task["log"]) > 4000:
         del task["log"][:1000]
         task["log"].insert(0, "... 日志过长，已截断 ...")
+        task["log_start"] = task.get("log_start", 0) + 999
 
 
 # ffmpeg -progress 输出的 key=value 行，只用于统计进度，不写进任务日志
@@ -1057,7 +730,27 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
     with TASKS_LOCK:
         task = TASKS[task_id]
         task["duration"] = duration
+    acquired = False
+    # 下载走独立队列，不与转码争 CPU 槽位；两类任务可以各自并行。
+    slots = DOWNLOAD_SLOTS if task.get("action") == "download" else TASK_SLOTS
     try:
+        # 并发槽位：超出的任务排队，避免多个 libx264 同时打满 NAS CPU。
+        # 等待期间持续检查取消标记，让排队中的任务可以被立即取消。
+        while True:
+            if slots.acquire(timeout=0.2):
+                acquired = True
+                break
+            with TASKS_LOCK:
+                if task.get("canceled"):
+                    task["status"] = "canceled"
+                    task["finished"] = time.time()
+                    return
+        with TASKS_LOCK:
+            if task.get("canceled"):
+                task["status"] = "canceled"
+                task["finished"] = time.time()
+                return
+            task["status"] = "running"
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1102,6 +795,12 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
             task["finished"] = time.time()
             task["proc"] = None
             failed = task.get("status") != "done"
+        if acquired:
+            try:
+                slots.release()
+            except ValueError:
+                pass
+        release_output(task.get("output"))
         if cleanup:
             for p in cleanup:
                 try:
@@ -1116,17 +815,19 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
 
 
 def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
-               total_bytes=None, partial=None):
+               total_bytes=None, partial=None, owner=None, owner_name="", output=None):
     task_id = uuid.uuid4().hex
     task = {
         "id": task_id,
         "tool": tool,
         "action": action,
         "cmd": " ".join(shlex.quote(x) for x in cmd),
-        "status": "running",
+        "status": "queued",  # 拿到并发槽位后由 run_task 置为 running
         # 拿不到总时长/总字节时用 -1 表示进度未知，避免界面一直显示 0%
         "progress": 0.0 if (duration or total_bytes) else -1.0,
         "log": [],
+        "log_seq": 0,
+        "log_start": 0,
         "created": time.time(),
         "finished": None,
         "returncode": None,
@@ -1136,6 +837,9 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "total_bytes": total_bytes,
         "written": 0,
         "elapsed": 0.0,
+        "owner": owner or "",
+        "owner_name": owner_name or "",
+        "output": output or "",
     }
     with TASKS_LOCK:
         TASKS[task_id] = task
@@ -1159,6 +863,10 @@ def cancel_task(task_id):
             return False
         proc = task.get("proc")
         task["canceled"] = True
+        if task.get("status") == "queued":
+            task["status"] = "canceled"
+            task["finished"] = time.time()
+            return True
         if proc:
             try:
                 proc.terminate()
@@ -1185,7 +893,97 @@ def ffmpeg_prefix(ffmpeg):
     return [ffmpeg, "-hide_banner", "-y", "-stats", "-stats_period", "1"]
 
 
-def build_ffmpeg(action, p):
+# 自定义命令只接受下面这些选项。原先参数被原样拼进 argv，
+# 可以追加 -i /任意路径 或第二个输出文件，绕过输入/输出目录沙箱读写任意文件。
+# 现在改为：选项白名单 + 值校验 + 唯一输入/唯一输出。
+CUSTOM_OPTS = {
+    "-i": True, "-map": True, "-map_metadata": True, "-map_chapters": True,
+    "-c": True, "-c:v": True, "-c:a": True, "-c:s": True, "-codec": True,
+    "-b:v": True, "-b:a": True, "-ab": True, "-ar": True, "-ac": True,
+    "-crf": True, "-preset": True, "-tune": True, "-profile:v": True,
+    "-level": True, "-pix_fmt": True, "-r": True, "-s": True, "-aspect": True,
+    "-vf": True, "-af": True, "-filter:v": True, "-filter:a": True,
+    "-filter_complex": True, "-q:v": True, "-q:a": True, "-qscale:v": True,
+    "-ss": True, "-t": True, "-to": True, "-threads": True,
+    "-movflags": True, "-metadata": True, "-disposition": True,
+    "-maxrate": True, "-bufsize": True, "-g": True, "-keyint_min": True,
+    "-vsync": True, "-fps_mode": True, "-strict": True, "-vol": True,
+    "-an": False, "-vn": False, "-sn": False, "-dn": False,
+    "-shortest": False, "-copyts": False, "-avoid_negative_ts": True,
+    "-write_tmcd": False, "-max_muxing_queue_size": True,
+}
+# 滤镜里能加载外部文件的构造，一律拒绝（防止 subtitles=/etc/... 之类读取越界文件）。
+CUSTOM_FILTER_FILE_RE = re.compile(
+    r"(?:^|[,;\[\]])\s*(?:movie|amovie|subtitles|ass|drawtext|concat|script|"
+    r"[a-z]*file)\s*=", re.I)
+
+
+def validate_custom_args(args, src, out):
+    """校验自定义参数，返回可安全拼进命令的 argv 片段。"""
+    if len(args) > 128:
+        raise ValueError("自定义参数过长（最多 128 项）")
+    checked = []
+    inputs = 0
+    outputs = 0
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token.startswith("-"):
+            if token not in CUSTOM_OPTS:
+                raise ValueError("自定义命令不允许使用选项 %s" % token)
+            checked.append(token)
+            if not CUSTOM_OPTS[token]:
+                i += 1
+                continue
+            if i + 1 >= len(args):
+                raise ValueError("选项 %s 缺少参数值" % token)
+            value = args[i + 1]
+            if value.startswith("-") and token != "-i":
+                raise ValueError("选项 %s 缺少参数值" % token)
+            if token == "-i":
+                if value != src:
+                    raise ValueError("只能使用当前选择的输入文件，不能追加其他输入")
+                inputs += 1
+            else:
+                _check_custom_value(token, value, src, out)
+            checked.append(value)
+            i += 2
+            continue
+        # 不以 - 开头的裸参数只能是唯一的输出文件，且必须等于系统生成的输出路径
+        if token != out:
+            raise ValueError("自定义命令不允许额外输出文件或裸参数：%s" % token)
+        outputs += 1
+        checked.append(token)
+        i += 1
+    if inputs > 1:
+        raise ValueError("自定义命令只允许一个输入文件")
+    if outputs > 1:
+        raise ValueError("自定义命令只允许一个输出文件")
+    # -vf/-af 等滤镜里若出现 file=.../movie=.../subtitles=... 之类外部文件加载，拒绝
+    for idx, token in enumerate(checked[:-1]):
+        if token in ("-vf", "-af", "-filter:v", "-filter:a", "-filter_complex"):
+            if CUSTOM_FILTER_FILE_RE.search(checked[idx + 1]):
+                raise ValueError("滤镜中不允许加载外部文件")
+    return checked
+
+
+def _check_custom_value(option, value, src, out):
+    if any(ch in value for ch in ("\r", "\n", "\x00")):
+        raise ValueError("参数值包含非法控制字符")
+    if value in (src, out):
+        return
+    if "://" in value:
+        raise ValueError("选项 %s 不允许使用协议地址" % option)
+    if value.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", value):
+        raise ValueError("选项 %s 不允许使用绝对路径" % option)
+    # key=/etc/... 这种「值里带绝对路径」的写法也要拦（如 -metadata comment=/etc/x）
+    if re.search(r"=\s*(?:/|[A-Za-z]:[\\/])", value):
+        raise ValueError("选项 %s 不允许使用绝对路径" % option)
+    if ".." in value.replace("\\", "/").split("/"):
+        raise ValueError("选项 %s 不允许路径穿越" % option)
+
+
+def build_ffmpeg(state, action, p):
     ffmpeg = require_ffmpeg()
     prefix = ffmpeg_prefix(ffmpeg)
 
@@ -1193,13 +991,9 @@ def build_ffmpeg(action, p):
         files = p.get("files") or []
         if len(files) < 2:
             raise ValueError("至少选择 2 个文件")
-        paths = [input_path(f) for f in files]
-        out = output_path(p.get("output"), ".mkv")
-        base, ext = os.path.splitext(out)
-        index = 1
-        while os.path.exists(out):
-            out = "%s (%d)%s" % (base, index, ext)
-            index += 1
+        paths = [input_path(state, f) for f in files]
+        # output_path 已统一处理同名文件，这里不再重复重命名。
+        out = output_path(state, p.get("output"), ".mkv")
         os.makedirs(LIST_DIR, exist_ok=True)
         listfile = os.path.join(LIST_DIR, uuid.uuid4().hex + ".txt")
         with open(listfile, "w", encoding="utf-8") as fp:
@@ -1216,10 +1010,10 @@ def build_ffmpeg(action, p):
             total += probe_duration(path) or 0.0
         return cmd, total or None, [listfile]
 
-    src = input_path(p.get("input"))
+    src = input_path(state, p.get("input"))
 
     if action == "convert":
-        out = output_path(p.get("output"), ".mp4")
+        out = output_path(state, p.get("output"), ".mp4")
         ext = os.path.splitext(out)[1].lower()
         if ext in AUDIO_CODECS:
             cmd = prefix + ["-i", src, "-vn"] + AUDIO_CODECS[ext] + [out]
@@ -1236,7 +1030,7 @@ def build_ffmpeg(action, p):
         return cmd, probe_duration(src), None
 
     if action == "compress":
-        out = output_path(p.get("output"), ".mp4")
+        out = output_path(state, p.get("output"), ".mp4")
         crf = clamp_int(p.get("crf"), 0, 51, 23)
         preset = p.get("preset") if p.get("preset") in (
             "ultrafast", "superfast", "veryfast", "faster", "fast",
@@ -1251,7 +1045,7 @@ def build_ffmpeg(action, p):
     if action == "trim":
         start = parse_time(p.get("start")) or 0.0
         duration = parse_time(p.get("duration"))
-        out = output_path(p.get("output"), ".mkv")
+        out = output_path(state, p.get("output"), ".mkv")
         cmd = prefix + ["-ss", "%.3f" % start, "-i", src]
         if duration and duration > 0:
             cmd += ["-t", "%.3f" % duration]
@@ -1264,7 +1058,7 @@ def build_ffmpeg(action, p):
         return cmd, duration, None
 
     if action == "extract_audio":
-        out = output_path(p.get("output"), ".mp3")
+        out = output_path(state, p.get("output"), ".mp3")
         ext = os.path.splitext(out)[1].lower()
         if ext not in AUDIO_CODECS:
             raise ValueError("不支持的音频格式：%s" % ext)
@@ -1275,10 +1069,10 @@ def build_ffmpeg(action, p):
         sub = p.get("subtitle")
         if not sub:
             raise ValueError("请选择字幕文件")
-        sub = real(sub if os.path.isabs(sub) else os.path.join(INPUT_DIR, sub))
-        if not within_roots(sub) or not os.path.isfile(sub):
+        sub = real(sub if os.path.isabs(sub) else os.path.join(state["input_dir"], sub))
+        if not within_roots(state, sub) or not os.path.isfile(sub):
             raise ValueError("字幕文件不存在或不可访问")
-        out = output_path(p.get("output"), ".mp4")
+        out = output_path(state, p.get("output"), ".mp4")
         vf = "subtitles=filename='%s'" % escape_filter_path(sub)
         font_size = p.get("font_size")
         if font_size:
@@ -1304,7 +1098,7 @@ def build_ffmpeg(action, p):
             scale = "scale=%d:-2" % width
         else:
             scale = "scale=-2:%d" % height
-        out = output_path(p.get("output"), ".mp4")
+        out = output_path(state, p.get("output"), ".mp4")
         cmd = prefix + ["-i", src, "-vf", scale,
                         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
                         "-c:a", "aac", "-b:a", "192k", out]
@@ -1322,7 +1116,7 @@ def build_ffmpeg(action, p):
         vf = mapping.get(direction)
         if not vf:
             raise ValueError("不支持的旋转方式")
-        out = output_path(p.get("output"), ".mp4")
+        out = output_path(state, p.get("output"), ".mp4")
         cmd = prefix + ["-i", src, "-vf", vf,
                         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
                         "-c:a", "aac", "-b:a", "192k", out]
@@ -1330,7 +1124,7 @@ def build_ffmpeg(action, p):
 
     if action == "screenshot":
         at = parse_time(p.get("time")) or 0.0
-        out = output_path(p.get("output"), ".jpg")
+        out = output_path(state, p.get("output"), ".jpg")
         cmd = prefix + ["-ss", "%.3f" % at, "-i", src, "-frames:v", "1", "-q:v", "2",
                         "-update", "1", out]
         return cmd, probe_duration(src), None
@@ -1343,14 +1137,16 @@ def build_ffmpeg(action, p):
             args = shlex.split(raw)
         except ValueError as exc:
             raise ValueError("参数解析失败：%s" % exc)
-        out = output_path(p.get("output"), ".mkv")
+        out = output_path(state, p.get("output"), ".mkv")
         has_in = any("{input}" in a for a in args)
         has_out = any("{output}" in a for a in args)
         args = [a.replace("{input}", src).replace("{output}", out) for a in args]
+        # 参数经过白名单与路径校验后才允许进入 argv。
+        checked = validate_custom_args(args, src, out)
         cmd = list(prefix)
         if not has_in:
             cmd += ["-i", src]
-        cmd += args
+        cmd += checked
         if not has_out:
             cmd += [out]
         return cmd, probe_duration(src), None
@@ -1384,14 +1180,91 @@ def download_headers(p):
     return headers
 
 
+MAX_REDIRECTS = 5
+
+
+def _public_ip(ip):
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+            or ip.is_reserved or ip.is_unspecified):
+        return False
+    return bool(ip.is_global)
+
+
+def validate_download_url(url):
+    """下载前解析并校验目标：只允许公网 http/https，拒绝回环/私网/链路本地等。"""
+    url = clean_media_url(url)
+    if not re.match(r"^https?://", url, re.I):
+        raise ValueError("目前只支持 http/https 地址")
+    if any(ch in url for ch in ("\r", "\n", "\t")):
+        raise ValueError("地址包含非法控制字符")
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("地址缺少主机名")
+    if parsed.username or parsed.password:
+        raise ValueError("地址不能包含用户名或密码")
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        raise ValueError("地址端口不合法")
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("无法解析地址 %s：%s" % (host, exc))
+    ips = set()
+    for info in infos:
+        try:
+            ips.add(ipaddress.ip_address(info[4][0]))
+        except ValueError:
+            continue
+    if not ips:
+        raise ValueError("无法解析地址 %s" % host)
+    for ip in ips:
+        if not _public_ip(ip):
+            raise ValueError("拒绝访问内网/回环/链路本地地址：%s（%s）" % (host, ip))
+    return url
+
+
+def validate_proxy(proxy):
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    if not re.match(r"^https?://", proxy, re.I):
+        raise ValueError("代理地址只支持 http:// 或 https://")
+    parsed = urlparse(proxy)
+    if not parsed.hostname:
+        raise ValueError("代理地址缺少主机名")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("代理端口不合法")
+    return proxy
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """每一跳重定向都重新做地址校验，并限制跳转次数。"""
+
+    max_redirections = MAX_REDIRECTS
+    max_repeats = 2
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        validate_download_url(target)
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
 def make_opener(proxy=""):
+    proxy = validate_proxy(proxy)
+    handlers = [_SafeRedirectHandler()]
     if proxy:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    return urllib.request.build_opener()
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener(*handlers)
 
 
 def fetch_text(url, headers, proxy="", limit=MAX_PAGE_BYTES):
+    url = validate_download_url(url)
     req = urllib.request.Request(url, headers=headers)
     try:
         with make_opener(proxy).open(req, timeout=20) as resp:
@@ -1417,6 +1290,7 @@ def fetch_text(url, headers, proxy="", limit=MAX_PAGE_BYTES):
 
 
 def content_length(url, headers, proxy=""):
+    url = validate_download_url(url)
     req = urllib.request.Request(url, headers=headers, method="HEAD")
     try:
         with make_opener(proxy).open(req, timeout=12) as resp:
@@ -1442,6 +1316,7 @@ def url_media_kind(url, ctype=""):
 
 
 def probe_url(url, headers, proxy=""):
+    url = validate_download_url(url)
     req = urllib.request.Request(url, headers=headers, method="HEAD")
     try:
         with make_opener(proxy).open(req, timeout=12) as resp:
@@ -1477,7 +1352,7 @@ def page_media_candidates(text, base_url):
 def resolve_media(url, headers, proxy=""):
     kind = url_media_kind(url)
     if kind:
-        return url, kind, ""
+        return validate_download_url(url), kind, ""
 
     final_url, ctype = probe_url(url, headers, proxy)
     kind = url_media_kind(final_url, ctype)
@@ -1493,7 +1368,10 @@ def resolve_media(url, headers, proxy=""):
     for candidate in media:
         kind = url_media_kind(candidate)
         if kind and candidate.startswith(("http://", "https://")):
-            return candidate, kind, title
+            try:
+                return validate_download_url(candidate), kind, title
+            except ValueError:
+                continue
 
     for iframe in iframes[:3]:
         try:
@@ -1507,7 +1385,10 @@ def resolve_media(url, headers, proxy=""):
         for candidate in sub_media:
             sub_kind = url_media_kind(candidate)
             if sub_kind and candidate.startswith(("http://", "https://")):
-                return candidate, sub_kind, title or sub_title
+                try:
+                    return validate_download_url(candidate), sub_kind, title or sub_title
+                except ValueError:
+                    continue
 
     raise ValueError("没有找到可直接下载的媒体地址。ffmpeg 只能处理直链、HLS(m3u8)、DASH(mpd) 或页面内公开的媒体地址；需要登录或加密解析的站点无法下载。")
 
@@ -1586,19 +1467,19 @@ def default_download_name(media_url, title, mode, audio_format):
     return name + ext
 
 
-def build_download(p):
+def build_download(state, p):
     url = clean_media_url(p.get("url"))
     if not url:
         raise ValueError("请填写视频地址")
-    if not re.match(r"^https?://", url, re.I):
-        raise ValueError("目前只支持 http/https 地址")
+    url = validate_download_url(url)
+    proxy = validate_proxy((p.get("proxy") or "").strip())
 
     ffmpeg = require_ffmpeg()
-    require_output_dir()
+    require_output_dir(state)
 
     headers = download_headers(p)
-    proxy = (p.get("proxy") or "").strip()
     media_url, kind, title = resolve_media(url, headers, proxy)
+    media_url = validate_download_url(media_url)
 
     note = ["下载引擎：ffmpeg", "媒体类型：%s" % {"hls": "HLS", "dash": "DASH"}.get(kind, "直链媒体")]
     total_time = None
@@ -1608,7 +1489,7 @@ def build_download(p):
             variants = hls_variants(text, final_url)
             if variants:
                 selected = pick_variant(variants, str(p.get("quality") or "best"))
-                media_url = selected["url"]
+                media_url = validate_download_url(selected["url"])
                 note.append("画质：%s" % (
                     "%dx%d" % (selected["width"], selected["height"])
                     if selected["width"] else "%d kbps" % (selected["bandwidth"] // 1000)))
@@ -1639,7 +1520,7 @@ def build_download(p):
     if subdir.startswith("/") or ".." in subdir.split("/"):
         raise ValueError("子目录不合法")
     target = (subdir + "/" if subdir else "") + filename
-    out = output_path(target, ".mp3" if mode == "audio" else ".mp4")
+    out = output_path(state, target, ".mp3" if mode == "audio" else ".mp4")
 
     cmd = [ffmpeg, "-hide_banner", "-y", "-nostdin", "-loglevel", "info",
            "-nostats", "-progress", "pipe:1"]
@@ -1655,6 +1536,7 @@ def build_download(p):
     # ffmpeg 7.1+ 默认按 URL 扩展名校验分片，HLS 常见 .mp4 后缀的 mpegts 分片会被判为不匹配
     if kind == "hls" and ffmpeg_support(ffmpeg, "extension_picky"):
         cmd += ["-extension_picky", "0"]
+    cmd += ["-protocol_whitelist", "http,https,tcp,tls,crypto"]
     cmd += ["-i", media_url]
 
     if mode == "audio":
@@ -1836,6 +1718,10 @@ def check_update(force=False):
 # HTTP 处理
 # --------------------------------------------------------------------------
 
+class PayloadTooLarge(Exception):
+    """请求体超过上限，统一回 413 而不是被当成普通 500。"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "VideoTool/%s" % APP_VERSION
 
@@ -1846,6 +1732,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "same-origin")
+        # 页面无内联脚本，样式里有少量 style="" 属性，因此只放开 style 的 inline。
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "font-src 'self' data:; connect-src 'self'; "
+                         "object-src 'none'; base-uri 'self'")
 
     def send_json(self, obj, code=200, extra_headers=None):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1867,10 +1759,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
             return
         ext = os.path.splitext(path)[1].lower()
+        etag = '"%s"' % hashlib.sha256(data).hexdigest()[:32]
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self._security_headers()
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", MIME.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("ETag", etag)
         self._security_headers()
         self.end_headers()
         self.wfile.write(data)
@@ -1879,7 +1780,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            length = 0
+            raise PayloadTooLarge("请求长度不合法")
+        if length < 0:
+            raise PayloadTooLarge("请求长度不合法")
+        if length > MAX_REQUEST_BYTES:
+            # 先把已发送的请求体排空再回 413，否则客户端还在写 body 时连接就被
+            # 关闭，浏览器只会看到「连接被重置」而不是可读的错误提示。
+            try:
+                self.rfile.read(min(length, 8 * 1024 * 1024))
+            except OSError:
+                pass
+            self.close_connection = True
+            raise PayloadTooLarge("请求体过大（上限 1 MB）")
         raw = self.rfile.read(length) if length > 0 else b""
         if not raw:
             return {}
@@ -1892,30 +1804,8 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
 
     def current_user(self):
-        return session_user(self)
-
-    def _auth_guard(self, path):
-        """静态资源与登录/状态接口放行，其余 API 均需登录。"""
-        if not path.startswith("/api/"):
-            return True
-        open_paths = ("/api/auth/status", "/api/auth/setup",
-                      "/api/auth/register", "/api/auth/login", "/api/auth/logout")
-        if path in open_paths:
-            return True
-        if self.current_user():
-            return True
-        self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
-        return False
-
-    def _require_admin(self):
-        user = self.current_user()
-        if not user:
-            self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
-            return None
-        if user.get("role") != "admin":
-            self.send_json({"error": "只有管理员可以管理用户", "code": "forbidden"}, 403)
-            return None
-        return user
+        refresh_roots()
+        return APP_STATE
 
     # ---------------- GET ----------------
 
@@ -1923,38 +1813,18 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
 
         try:
-            if not self._auth_guard(path):
-                return
             if path in ("/", "/index.html"):
                 self.send_file(os.path.join(UI_DIR, "index.html"))
-            elif path == "/api/auth/status":
-                self.api_auth_status()
-            elif path == "/api/users":
-                self.api_users()
-            elif path == "/api/registration":
-                self.api_registration()
             elif path == "/api/config":
                 self.api_config()
             elif path == "/api/tools":
-                user = self.current_user()
-                identity = detect_fnos_identity(self)
+                state = self.current_user()
                 info = tool_info()
                 info.update({
-                    "input_dir": INPUT_DIR,
-                    "output_dir": OUTPUT_DIR,
-                    "roots": ROOTS,
+                    "input_dir": state["input_dir"],
+                    "output_dir": state["output_dir"],
+                    "roots": list(state["roots"]),
                     "pkgvar": PKGVAR,
-                    "auth_enabled": users_configured(),
-                    "auth_file": USERS_PATH,
-                    "username": user["username"] if user else "",
-                    "role": user["role"] if user else "",
-                    "is_admin": bool(user and user.get("role") == "admin"),
-                    "primary": bool(user and user.get("primary")),
-                    "identity_source": identity.get("source") if identity else "none",
-                    "identity_note": identity_note(identity),
-                    "identity_detected": bool(identity),
-                    "allow_register": bool(ALLOW_REGISTER),
-                    "register_approval": bool(REGISTER_APPROVAL),
                 })
                 self.send_json(info)
             elif path == "/api/update":
@@ -1975,76 +1845,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_file(target)
                 else:
                     self.send_json({"error": "not found"}, 404)
+        except PayloadTooLarge as exc:
+            self.send_json({"error": str(exc), "code": "payload_too_large"}, 413)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
 
-    def api_auth_status(self):
-        user = self.current_user()
-        identity = detect_fnos_identity(self)
-        primary = primary_user()
-        self.send_json({
-            "configured": users_configured(),
-            "authenticated": bool(user),
-            "setup_required": not users_configured(),
-            "password_min": PASSWORD_MIN,
-            "username": user["username"] if user else "",
-            "role": user["role"] if user else "",
-            "is_admin": bool(user and user.get("role") == "admin"),
-            "primary": bool(user and user.get("primary")),
-            "primary_username": primary["username"] if primary else "",
-            "auth_file": USERS_PATH,
-            "allow_register": bool(ALLOW_REGISTER),
-            "register_approval": bool(REGISTER_APPROVAL),
-            "identity_source": identity.get("source") if identity else "none",
-            "identity_note": identity_note(identity),
-            "identity_detected": bool(identity),
-            "identity_username": identity.get("username") if identity else "",
-            "identity_is_admin": bool(identity and identity.get("is_admin")),
-        })
-
-    def api_registration(self):
-        if not self._require_admin():
-            return
-        identity = detect_fnos_identity(self)
-        primary = primary_user()
-        with USERS_LOCK:
-            pending = [u["username"] for u in USERS if not u.get("approved", True)]
-        self.send_json({
-            "allow_register": bool(ALLOW_REGISTER),
-            "register_approval": bool(REGISTER_APPROVAL),
-            "identity_source": identity.get("source") if identity else "none",
-            "identity_note": identity_note(identity),
-            "identity_detected": bool(identity),
-            "primary_username": primary["username"] if primary else "",
-            "pending": pending,
-        })
-
-    def api_users(self):
-        if not self._require_admin():
-            return
-        with USERS_LOCK:
-            users = [user_public(u) for u in sorted(USERS, key=lambda x: x["username"])]
-        self.send_json({"users": users, "current": self.current_user()["username"]})
-
-    def api_config(self):
-        input_ok, input_error = dir_state(INPUT_DIR, False)
-        output_ok, output_error = dir_state(OUTPUT_DIR, True)
+    def config_payload(self, state):
+        input_ok, input_error = dir_state(state["input_dir"], False, state)
+        output_ok, output_error = dir_state(state["output_dir"], True, state)
         resolve_binaries()
-        self.send_json({
-            "input_dir": INPUT_DIR,
-            "output_dir": OUTPUT_DIR,
+        return {
+            "input_dir": state["input_dir"],
+            "output_dir": state["output_dir"],
             "input_ok": input_ok,
             "input_error": input_error,
             "output_ok": output_ok,
             "output_error": output_error,
             "configured": input_ok and output_ok,
-            "roots": ROOTS,
+            "roots": list(state["roots"]),
             "pkgvar": PKGVAR,
             "ffmpeg": FFMPEG_BIN,
             "ffprobe": FFPROBE_BIN,
             "ffmpeg_ready": bool(FFMPEG_BIN),
             "ffmpeg_error": FFMPEG_ERROR,
-        })
+        }
+
+    def api_config(self):
+        self.send_json(self.config_payload(self.current_user()))
 
     def api_update(self):
         q = self.query()
@@ -2052,19 +1879,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(check_update(force))
 
     def api_browse(self):
-        q = self.query()
-        path = q.get("path") or INPUT_DIR or OUTPUT_DIR or (ROOTS[0] if ROOTS else "/")
-        if not path:
-            self.send_json({"error": "缺少 path"}, 400)
+        state = self.current_user()
+        raw = (self.query().get("path") or "").strip()
+        roots = list(state["roots"])
+        if not roots:
+            self.send_json({
+                "path": "", "parent": None, "roots": [], "dirs": [],
+                "readable": False, "writable": False,
+                "error": "尚未授权任何目录。请先在 系统设置 › 应用 › 视频助手 › 访问权限 "
+                         "中添加文件夹，授权后回到这里重新选择。",
+            })
             return
-        path = real(path)
+        if not raw:
+            # 根视图：只列出已授权目录，不展示卷上其它目录，也不接受手填路径。
+            dirs = []
+            for root in roots:
+                dirs.append({
+                    "name": os.path.basename(root.rstrip(os.sep)) or root,
+                    "path": root,
+                    "writable": os.access(root, os.W_OK),
+                })
+            self.send_json({
+                "path": "", "parent": None, "roots": roots, "dirs": dirs,
+                "readable": True, "writable": False, "error": "",
+            })
+            return
+        path = real(raw)
+        if not within_user_root(state, path):
+            self.send_json({
+                "error": "只能浏览已授权目录：%s（%s 已越界）。%s"
+                         % (scope_text(state), path, OUT_OF_SCOPE_HINT),
+                "code": "path_outside_authorized_root",
+            }, 403)
+            return
         if is_app_dir(path):
             self.send_json({"error": "不能浏览应用自身目录"}, 403)
             return
         if not os.path.isdir(path):
             self.send_json({"error": "目录不存在：%s" % path}, 404)
             return
-        add_root(path)
 
         dirs = []
         error = ""
@@ -2079,7 +1932,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         if not entry.is_dir():
                             continue
-                        if is_app_dir(entry.path):
+                        if is_app_dir(entry.path) or not within_user_root(state, entry.path):
                             continue
                         dirs.append({
                             "name": entry.name,
@@ -2090,19 +1943,21 @@ class Handler(BaseHTTPRequestHandler):
                         continue
         except PermissionError:
             readable = False
-            error = "没有权限访问该目录，请先在 系统设置 > 应用 > 视频助手 中授权，或直接粘贴完整路径"
+            error = "没有权限访问该目录，请先在 系统设置 › 应用 › 视频助手 › 访问权限 中授权"
         except OSError as exc:
             readable = False
             error = "读取目录失败：%s" % exc
 
         dirs.sort(key=lambda x: x["name"].lower())
-        parent = os.path.dirname(path)
-        if parent == path or is_app_dir(parent):
-            parent = None
+        is_root = path in roots
+        parent = "" if is_root else os.path.dirname(path)
+        if not is_root and (parent == path or is_app_dir(parent)
+                            or not within_user_root(state, parent)):
+            parent = ""
         self.send_json({
             "path": path,
             "parent": parent,
-            "roots": ROOTS,
+            "roots": roots,
             "dirs": dirs,
             "readable": readable,
             "writable": os.access(path, os.W_OK),
@@ -2110,25 +1965,33 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def api_files(self):
+        state = self.current_user()
         q = self.query()
-        if not INPUT_DIR:
+        if not state["input_dir"]:
             self.send_json({"error": "请先在设置中选择输入目录"}, 400)
             return
-        path = q.get("path") or INPUT_DIR
+        path = q.get("path") or state["input_dir"]
         path = real(path)
-        if not inside(path, INPUT_DIR):
-            self.send_json({"error": "只能读取输入目录中的文件"}, 403)
+        if not within_user_root(state, path):
+            self.send_json({
+                "error": "只能读取已授权目录：%s（%s 已越界）。%s"
+                         % (scope_text(state), path, OUT_OF_SCOPE_HINT),
+                "code": "path_outside_authorized_root",
+            }, 403)
+            return
+        if not inside(path, state["input_dir"]):
+            self.send_json({"error": "只能读取你自己的输入目录中的文件"}, 403)
             return
         if not os.path.isdir(path):
             self.send_json({"error": "目录不存在"}, 404)
             return
-        ok, err = dir_state(path, False)
+        ok, err = dir_state(path, False, state)
         if not ok:
             self.send_json({"error": "输入目录不可用：%s" % err}, 403)
             return
 
         files = []
-        out_real = real(OUTPUT_DIR) if OUTPUT_DIR else ""
+        out_real = real(state["output_dir"]) if state["output_dir"] else ""
         skip_dirs = {"#recycle", "@eadir", "$recycle.bin", "lost+found", "system volume information"}
 
         def on_walk_error(exc):
@@ -2144,7 +2007,9 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if out_real and real(full) == out_real:
                         continue
-                    if is_app_dir(full):
+                    if is_blocked_app_dir(state, full):
+                        continue
+                    if not within_user_root(state, full):
                         continue
                     kept.append(d)
                 kept.sort(key=str.lower)
@@ -2162,6 +2027,9 @@ class Handler(BaseHTTPRequestHandler):
                     ext = os.path.splitext(name)[1].lower()
                     kind = "video" if ext in VIDEO_EXTS else "audio" if ext in AUDIO_EXTS else "subtitle" if ext in SUB_EXTS else None
                     if not kind:
+                        continue
+                    if not within_user_root(state, full):
+                        # 软链接指向允许根目录之外的文件一律不展示。
                         continue
                     try:
                         st = os.stat(full)
@@ -2194,21 +2062,32 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def api_probe(self):
+        state = self.current_user()
         q = self.query()
         path = q.get("path") or ""
         if not path:
             self.send_json({"error": "缺少 path"}, 400)
             return
         path = real(path)
-        if not INPUT_DIR or not inside(path, INPUT_DIR) or not os.path.isfile(path):
+        if not within_user_root(state, path):
+            self.send_json({
+                "error": "只能读取已授权目录：%s（%s 已越界）。%s"
+                         % (scope_text(state), path, OUT_OF_SCOPE_HINT),
+                "code": "path_outside_authorized_root",
+            }, 403)
+            return
+        if not state["input_dir"] or not inside(path, state["input_dir"]) or not os.path.isfile(path):
             self.send_json({"error": "文件不存在或不可访问"}, 404)
             return
         self.send_json(probe_file(path))
 
     def api_tasks(self):
+        state = self.current_user()
         with TASKS_LOCK:
             items = []
-            for task in sorted(TASKS.values(), key=lambda t: t["created"], reverse=True)[:20]:
+            for task in sorted(TASKS.values(), key=lambda t: t["created"], reverse=True):
+                if task.get("owner") != state["key"]:
+                    continue
                 items.append({
                     "id": task["id"],
                     "tool": task["tool"],
@@ -2219,15 +2098,27 @@ class Handler(BaseHTTPRequestHandler):
                     "elapsed": task.get("elapsed", 0.0),
                     "created": task["created"],
                     "finished": task["finished"],
+                    "owner": task.get("owner") or "",
+                    "owner_name": task.get("owner_name") or "",
                 })
-        self.send_json({"tasks": items})
+                if len(items) >= 20:
+                    break
+        self.send_json({"tasks": items, "scope": "mine"})
 
     def api_log(self, task_id):
+        state = self.current_user()
+        try:
+            since = max(0, int(self.query().get("since") or 0))
+        except ValueError:
+            since = 0
         with TASKS_LOCK:
             task = TASKS.get(task_id)
-            if not task:
+            if not task or task.get("owner") != state["key"]:
                 self.send_json({"error": "任务不存在"}, 404)
                 return
+            log_start = int(task.get("log_start") or 0)
+            # 日志被截断过时下标会整体左移，用 log_start 把 since 换算回当前数组下标。
+            chunk = list(task["log"][max(0, since - log_start):])
             payload = {
                 "id": task["id"],
                 "status": task["status"],
@@ -2235,7 +2126,10 @@ class Handler(BaseHTTPRequestHandler):
                 "written": task.get("written", 0),
                 "elapsed": task.get("elapsed", 0.0),
                 "returncode": task["returncode"],
-                "log": list(task["log"]),
+                "log": chunk,
+                "since": since,
+                "next": log_start + len(task["log"]),
+                "total": int(task.get("log_seq") or 0),
             }
         self.send_json(payload)
 
@@ -2244,32 +2138,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if not self._auth_guard(path):
-                return
-            if path == "/api/auth/setup":
-                self.api_auth_setup()
-            elif path == "/api/auth/register":
-                self.api_auth_register()
-            elif path == "/api/auth/login":
-                self.api_auth_login()
-            elif path == "/api/auth/logout":
-                self.api_auth_logout()
-            elif path == "/api/auth/password":
-                self.api_auth_password()
-            elif path == "/api/registration/settings":
-                self.api_registration_settings()
-            elif path == "/api/users/create":
-                self.api_user_create()
-            elif path == "/api/users/update":
-                self.api_user_update()
-            elif path == "/api/users/password":
-                self.api_user_password()
-            elif path == "/api/users/delete":
-                self.api_user_delete()
-            elif path == "/api/config":
+            if path == "/api/config":
                 self.api_save_config()
-            elif path == "/api/checkdir":
-                self.api_checkdir()
             elif path == "/api/mkdir":
                 self.api_mkdir()
             elif path == "/api/task":
@@ -2278,317 +2148,53 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_cancel(path[len("/api/cancel/"):])
             else:
                 self.send_json({"error": "not found"}, 404)
+        except PayloadTooLarge as exc:
+            self.send_json({"error": str(exc), "code": "payload_too_large"}, 413)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, 400)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
 
-    def _session_saved(self, token, remember):
-        max_age = SESSION_TTL_REMEMBER if remember else None
-        return [("Set-Cookie", make_session_cookie(token, max_age))]
-
-    def api_auth_setup(self):
-        if users_configured():
-            self.send_json({"error": "管理员账号已设置，请直接登录", "code": "already_configured"}, 409)
-            return
-        data = self.read_json()
-        username = normalize_username(data.get("username") or "admin")
-        password = check_password_value(data.get("password"), username)
-        check_confirm(password, data.get("confirm"))
-        remember = bool(data.get("remember", True))
-        identity = detect_fnos_identity(self)
-        create_user(username, password, role="admin", enabled=True, approved=True,
-                    primary=True, created_via="setup",
-                    fnos_uid=identity.get("uid") if identity else "",
-                    fnos_username=identity.get("username") if identity else "")
-        token = issue_session(username, remember)
-        self.send_json({"ok": True, "configured": True, "username": username,
-                        "role": "admin", "is_admin": True, "primary": True},
-                       extra_headers=self._session_saved(token, remember))
-
-    def api_auth_register(self):
-        if users_configured() and not ALLOW_REGISTER:
-            self.send_json({"error": "管理员已关闭公开注册，请联系管理员创建账号",
-                            "code": "register_disabled"}, 403)
-            return
-        data = self.read_json()
-        username = normalize_username(data.get("username"))
-        password = check_password_value(data.get("password"), username)
-        check_confirm(password, data.get("confirm"))
-        remember = bool(data.get("remember", True))
-        identity = detect_fnos_identity(self)
-        if identity:
-            bound = fnos_bound_user(identity.get("uid"), identity.get("username"))
-            if bound:
-                self.send_json({"error": "该飞牛账号已注册：%s" % bound["username"],
-                                "code": "fnos_bound"}, 409)
-                return
-        with USERS_LOCK:
-            first = not USERS
-            has_primary = any(u.get("primary") for u in USERS)
-        if identity:
-            role = "admin" if identity.get("is_admin") else "user"
-            primary = bool(identity.get("is_admin") and not has_primary)
-            approved = bool(identity.get("is_admin")) or not REGISTER_APPROVAL
-        else:
-            role = "admin" if first else "user"
-            primary = bool(first)
-            approved = bool(first) or not REGISTER_APPROVAL
-        user = create_user(username, password, role=role, enabled=True,
-                           approved=approved, primary=primary, created_via="register",
-                           fnos_uid=identity.get("uid") if identity else "",
-                           fnos_username=identity.get("username") if identity else "")
-        if not approved:
-            primary_name = primary_user()
-            self.send_json({
-                "ok": True, "pending": True, "approved": False,
-                "username": username,
-                "message": "注册申请已提交，请等待管理员审批后登录",
-                "primary_username": primary_name["username"] if primary_name else "",
-            }, 202)
-            return
-        token = issue_session(username, remember)
-        self.send_json({"ok": True, "configured": True, "username": username,
-                        "role": user["role"], "is_admin": user["role"] == "admin",
-                        "primary": bool(user.get("primary")),
-                        "identity_source": identity.get("source") if identity else "none"},
-                       extra_headers=self._session_saved(token, remember))
-
-    def api_auth_login(self):
-        if not users_configured():
-            self.send_json({"error": "尚未设置管理员账号", "code": "setup_required"}, 409)
-            return
-        ip = self.client_address[0]
-        if login_fail_count(ip) >= LOGIN_MAX_FAILS:
-            self.send_json({"error": "尝试次数过多，请稍后再试", "code": "too_many_attempts"},
-                           429, [("Retry-After", str(LOGIN_WINDOW))])
-            return
-        data = self.read_json()
-        username = (data.get("username") or "").strip().lower()
-        password = data.get("password")
-        if not isinstance(password, str):
-            password = ""
-        user = find_user(username)
-        if not user or not user.get("enabled") or not user.get("approved", True) \
-                or not _check_password(user, password):
-            note_login_fail(ip)
-            time.sleep(0.35)
-            if user and not user.get("enabled"):
-                self.send_json({"error": "该账号已被停用", "code": "disabled"}, 403)
-            elif user and not user.get("approved", True):
-                self.send_json({"error": "账号等待管理员审批", "code": "pending"}, 403)
-            else:
-                self.send_json({"error": "账号或密码不正确", "code": "bad_password"}, 401)
-            return
-        clear_login_fail(ip)
-        remember = bool(data.get("remember", True))
-        token = issue_session(user["username"], remember)
-        self.send_json({"ok": True, "configured": True,
-                        "username": user["username"], "role": user["role"],
-                        "is_admin": user["role"] == "admin",
-                        "primary": bool(user.get("primary"))},
-                       extra_headers=self._session_saved(token, remember))
-
-    def api_auth_logout(self):
-        drop_session(cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE))
-        self.send_json({"ok": True},
-                       extra_headers=[("Set-Cookie",
-                                       "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
-                                       % SESSION_COOKIE)])
-
-    def api_auth_password(self):
-        user = self.current_user()
-        if not user:
-            self.send_json({"error": "未登录或登录已过期", "code": "unauthorized"}, 401)
-            return
-        data = self.read_json()
-        set_user_password(user["username"], data.get("password"))
-        token = cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE)
-        drop_user_sessions(user["username"], keep=token)
-        self.send_json({"ok": True})
-
-    def api_registration_settings(self):
-        global ALLOW_REGISTER, REGISTER_APPROVAL
-        if not self._require_admin():
-            return
-        data = self.read_json()
-        if "allow_register" in data:
-            ALLOW_REGISTER = bool(data.get("allow_register"))
-        if "register_approval" in data:
-            REGISTER_APPROVAL = bool(data.get("register_approval"))
-        save_config()
-        self.send_json({"ok": True, "allow_register": bool(ALLOW_REGISTER),
-                        "register_approval": bool(REGISTER_APPROVAL)})
-
-    def api_user_create(self):
-        if not self._require_admin():
-            return
-        data = self.read_json()
-        username = normalize_username(data.get("username"))
-        password = check_password_value(data.get("password"), username)
-        check_confirm(password, data.get("confirm"), required=False)
-        role = "admin" if data.get("role") == "admin" else "user"
-        user = create_user(username, password, role=role, enabled=True,
-                           approved=True, created_via="admin")
-        self.send_json({"ok": True, "user": user_public(user)})
-
-    def api_user_update(self):
-        if not self._require_admin():
-            return
-        operator = self.current_user()
-        data = self.read_json()
-        username = (data.get("username") or "").strip().lower()
-        user = find_user(username)
-        if not user:
-            raise ValueError("账号不存在")
-        if user.get("primary"):
-            if data.get("enabled") is False:
-                raise ValueError("主账号不能被停用")
-            if data.get("approved") is False:
-                raise ValueError("主账号不能被取消审批")
-            if "role" in data and data.get("role") != "admin":
-                raise ValueError("主账号不能被降级")
-        if "approved" in data:
-            user["approved"] = bool(data.get("approved"))
-        if "enabled" in data:
-            enabled = bool(data.get("enabled"))
-            if not enabled and user["username"] == operator["username"]:
-                raise ValueError("不能停用当前登录的管理员账号")
-            if (not enabled and user["role"] == "admin"
-                    and admin_count() <= 1):
-                raise ValueError("至少需要保留一个可用的管理员账号")
-            user["enabled"] = enabled
-        if "role" in data:
-            role = "admin" if data.get("role") == "admin" else "user"
-            if (role != "admin" and user["role"] == "admin"
-                    and (user["username"] == operator["username"] or admin_count() <= 1)):
-                raise ValueError("不能降级当前账号或最后一个管理员")
-            user["role"] = role
-        user["updated"] = int(time.time())
-        try:
-            save_users()
-        except OSError:
-            raise ValueError("保存账号失败，请检查配置目录权限")
-        if not user.get("enabled") or not user.get("approved", True):
-            drop_user_sessions(user["username"])
-        self.send_json({"ok": True, "user": user_public(user)})
-
-    def api_user_password(self):
-        if not self._require_admin():
-            return
-        data = self.read_json()
-        username = (data.get("username") or "").strip().lower()
-        set_user_password(username, data.get("password"))
-        drop_user_sessions(username)
-        self.send_json({"ok": True})
-
-    def api_user_delete(self):
-        if not self._require_admin():
-            return
-        operator = self.current_user()
-        data = self.read_json()
-        username = (data.get("username") or "").strip().lower()
-        if username == operator["username"]:
-            raise ValueError("不能删除当前登录的管理员账号")
-        with USERS_LOCK:
-            target = next((u for u in USERS if u["username"] == username), None)
-            if not target:
-                raise ValueError("账号不存在")
-            if target.get("primary"):
-                raise ValueError("主账号不能删除")
-            if target["role"] == "admin" and admin_count() <= 1:
-                raise ValueError("至少需要保留一个管理员账号")
-            USERS.remove(target)
-            try:
-                save_users()
-            except OSError:
-                USERS.append(target)
-                raise ValueError("保存账号失败，请检查配置目录权限")
-        drop_user_sessions(username)
-        self.send_json({"ok": True})
-
     def api_save_config(self):
-        global INPUT_DIR, OUTPUT_DIR
+        state = self.current_user()
         data = self.read_json()
-        new_input = data.get("input_dir") if "input_dir" in data else INPUT_DIR
-        new_output = data.get("output_dir") if "output_dir" in data else OUTPUT_DIR
-        new_input = (new_input or "").strip()
-        new_output = (new_output or "").strip()
+        with CONFIG_LOCK:
+            new_input = data.get("input_dir") if "input_dir" in data else state["input_dir"]
+            new_output = data.get("output_dir") if "output_dir" in data else state["output_dir"]
+            new_input = (new_input or "").strip()
+            new_output = (new_output or "").strip()
 
-        if new_input:
-            if not os.path.isabs(new_input):
-                raise ValueError("请输入完整路径，例如 /vol1/1000/视频")
-            new_input = real(new_input)
-            if not os.path.isdir(new_input):
-                raise ValueError("输入目录不存在：%s" % new_input)
-            if is_app_dir(new_input):
-                raise ValueError("输入目录不能使用应用自身目录")
-            ok, err = dir_state(new_input, False)
-            if not ok:
-                raise ValueError("输入目录不可用：%s" % err)
+            def check_new_dir(value, write, label):
+                if not value:
+                    return ""
+                if not os.path.isabs(value):
+                    raise ValueError("请输入完整路径，例如 /vol1/共享/视频")
+                path = real(value)
+                if not os.path.isdir(path):
+                    raise ValueError("%s不存在：%s" % (label, path))
+                if is_app_dir(path):
+                    raise ValueError("%s不能使用应用自身目录" % label)
+                if not within_user_root(state, path):
+                    raise ValueError("%s不在已授权目录内：%s。%s"
+                                     % (label, path, OUT_OF_SCOPE_HINT))
+                ok, err = dir_state(path, write, None, enforce_scope=False)
+                if not ok:
+                    raise ValueError("%s不可用：%s" % (label, err))
+                return path
 
-        if new_output:
-            if not os.path.isabs(new_output):
-                raise ValueError("请输入完整路径，例如 /vol1/1000/输出")
-            new_output = real(new_output)
-            if not os.path.isdir(new_output):
-                raise ValueError("输出目录不存在：%s" % new_output)
-            if is_app_dir(new_output):
-                raise ValueError("输出目录不能使用应用自身目录")
-            ok, err = dir_state(new_output, True)
-            if not ok:
-                raise ValueError("输出目录不可用：%s" % err)
+            new_input = check_new_dir(new_input, False, "输入目录")
+            new_output = check_new_dir(new_output, True, "输出目录")
 
-        INPUT_DIR = new_input
-        OUTPUT_DIR = new_output
-        for p in (INPUT_DIR, OUTPUT_DIR):
-            if p:
-                add_root(p)
-        resolve_binaries()
-        save_config()
+            state["input_dir"] = new_input
+            state["output_dir"] = new_output
+            save_config()
 
-        input_ok, input_error = dir_state(INPUT_DIR, False)
-        output_ok, output_error = dir_state(OUTPUT_DIR, True)
-        self.send_json({
-            "ok": True,
-            "input_dir": INPUT_DIR,
-            "output_dir": OUTPUT_DIR,
-            "input_ok": input_ok,
-            "input_error": input_error,
-            "output_ok": output_ok,
-            "output_error": output_error,
-            "roots": ROOTS,
-            "ffmpeg": FFMPEG_BIN,
-            "ffprobe": FFPROBE_BIN,
-            "ffmpeg_ready": bool(FFMPEG_BIN),
-            "ffmpeg_error": FFMPEG_ERROR,
-        })
-
-    def api_checkdir(self):
-        data = self.read_json()
-        path = (data.get("path") or "").strip()
-        purpose = (data.get("purpose") or "input").strip()
-        if not path:
-            raise ValueError("请填写目录路径")
-        if not os.path.isabs(path):
-            raise ValueError("请填写完整路径，例如 /vol1/1000/视频")
-        path = real(path)
-        if is_app_dir(path):
-            raise ValueError("不能使用应用自身目录")
-        if not os.path.isdir(path):
-            raise ValueError("目录不存在：%s" % path)
-        ok, err = dir_state(path, purpose == "output")
-        if not ok:
-            raise ValueError(err)
-        add_root(path)
-        self.send_json({
-            "ok": True,
-            "path": path,
-            "writable": os.access(path, os.W_OK),
-            "roots": ROOTS,
-        })
+        payload = self.config_payload(state)
+        payload["ok"] = True
+        self.send_json(payload)
 
     def api_mkdir(self):
+        state = self.current_user()
         data = self.read_json()
         path = (data.get("path") or "").strip()
         if not path:
@@ -2596,46 +2202,60 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isabs(path):
             raise ValueError("请填写完整路径")
         path = real(path)
-        if path == os.sep or is_app_dir(path):
+        require_user_path(state, path, "新建目录")
+        if path == os.sep or is_blocked_app_dir(state, path):
             raise ValueError("不能使用应用自身目录")
         parent = os.path.dirname(path)
+        require_user_path(state, parent, "上级目录")
         if not os.path.isdir(parent):
             raise ValueError("上级目录不存在")
         if not os.access(parent, os.W_OK | os.X_OK):
-            raise ValueError("没有写入权限，请先在 系统设置 > 应用 > 视频助手 中授权该文件夹")
+            raise ValueError("没有写入权限，请先在 系统设置 › 应用 › 视频助手 › 访问权限 中授权该目录")
         try:
             os.makedirs(path, exist_ok=True)
         except OSError as exc:
             raise ValueError("创建失败：%s" % exc)
         if not os.path.isdir(path):
             raise ValueError("创建失败")
-        add_root(parent)
+        add_root(state, parent)
         self.send_json({"ok": True, "path": path})
 
     def api_task(self):
+        state = self.current_user()
         data = self.read_json()
         action = (data.get("action") or "").strip()
         params = data.get("params") or {}
         if not isinstance(params, dict):
             raise ValueError("参数格式不正确")
 
+        # 每次请求从干净状态开始，构建命令时由 output_path 记录实际输出路径。
+        LAST_OUTPUT.path = ""
+        # 自定义 ffmpeg 参数在 build_ffmpeg 里经过选项白名单与路径校验。
         note = None
         total_bytes = None
         partial = None
         if action == "download":
             tool = "ffmpeg"
-            cmd, duration, cleanup, note, total_bytes, partial = build_download(params)
+            cmd, duration, cleanup, note, total_bytes, partial = build_download(state, params)
         elif action.startswith("ytdlp"):
             raise ValueError("已移除 yt-dlp，请使用 ffmpeg 原生下载")
         else:
             tool = "ffmpeg"
-            cmd, duration, cleanup = build_ffmpeg(action, params)
+            cmd, duration, cleanup = build_ffmpeg(state, action, params)
 
         task = start_task(tool, action, cmd, duration=duration, cleanup=cleanup,
-                          note=note, total_bytes=total_bytes, partial=partial)
+                          note=note, total_bytes=total_bytes, partial=partial,
+                          owner=state["key"], owner_name="本地",
+                          output=getattr(LAST_OUTPUT, "path", ""))
         self.send_json({"task": task["id"], "cmd": task["cmd"]})
 
     def api_cancel(self, task_id):
+        state = self.current_user()
+        with TASKS_LOCK:
+            task = TASKS.get(task_id)
+            if not task or task.get("owner") != state["key"]:
+                self.send_json({"error": "任务不存在"}, 404)
+                return
         ok = cancel_task(task_id)
         if not ok:
             self.send_json({"error": "任务不存在"}, 404)
@@ -2667,16 +2287,75 @@ def stop_all_tasks():
             pass
 
 
+def _startup_log(message):
+    print("[startup] %s" % message, flush=True)
+
+
+def _startup_fail(problems):
+    for problem in problems:
+        _startup_log("ERROR: " + problem)
+    _startup_log("HINT: 请检查数据目录权限、python 版本和端口占用；"
+                 "飞牛上可运行 ss -ltnp | grep 18080 查看端口。")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--host", default=os.environ.get("VT_BIND_HOST") or "0.0.0.0")
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("VT_BIND_PORT") or "18080"))
     args = parser.parse_args()
 
-    load_config()
-    load_users()
-    load_sessions()
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    _startup_log("VideoTool %s 启动中（Python %s）" % (
+        APP_VERSION, ".".join(str(n) for n in sys.version_info[:3])))
+    if sys.version_info < (3, 8):
+        _startup_fail(["Python 版本过低：需要 3.8 及以上，当前为 %s"
+                       % ".".join(str(n) for n in sys.version_info[:3])])
+
+    init_app_state()
+
+    problems = []
+    for label, path in (("数据目录", PKGVAR), ("任务列表目录", LIST_DIR)):
+        if not os.path.isdir(path):
+            problems.append("%s不存在或无法创建：%s" % (label, path))
+        elif not os.access(path, os.W_OK):
+            problems.append("%s不可写：%s" % (label, path))
+    if not os.path.isdir(UI_DIR):
+        problems.append("前端目录不存在：%s" % UI_DIR)
+    if problems:
+        _startup_fail(problems)
+
+    resolve_binaries()
+    _startup_log("数据目录：%s（可写）" % PKGVAR)
+    _startup_log("ffmpeg：%s" % (FFMPEG_BIN or ("未找到（" + FFMPEG_ERROR + "）")))
+    _startup_log("ffprobe：%s" % (FFPROBE_BIN or "未找到（媒体信息读取会失败）"))
+    if not FFMPEG_BIN:
+        _startup_log("WARN: 系统未找到 ffmpeg，视频处理任务会失败；"
+                     "请在飞牛应用中心或系统环境安装 ffmpeg 后重启应用。")
+    elif not FFPROBE_BIN:
+        _startup_log("WARN: 系统未找到 ffprobe，媒体时长/编码识别会失败；"
+                     "请安装完整的 ffmpeg（包含 ffprobe）。")
+
+    _startup_log("访问方式：无需登录；目录范围以 fnOS 应用授权目录为准")
+    roots = refresh_roots()
+    if roots:
+        _startup_log("已授权目录：%s" % "、".join(roots))
+    else:
+        _startup_log("WARN: 尚未授权任何目录，请先在 系统设置 › 应用 › 视频助手 › 访问权限 中添加")
+    _startup_log("运行用户：%s" % (os.environ.get("TRIM_USERNAME") or "video-tool"))
+
+    httpd = None
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        hint = ""
+        if getattr(exc, "errno", None) in (48, 98, 10048):
+            hint = "端口可能已被其他进程占用。"
+        _startup_log("ERROR: 无法监听 %s:%d：%s %s" % (
+            args.host, args.port, exc, hint))
+        _startup_log("HINT: 在飞牛上运行 ss -ltnp | grep ':%d' 查看占用进程；"
+                     "也可以设置环境变量 VT_BIND_PORT 改用其他端口。" % args.port)
+        sys.exit(1)
     httpd.daemon_threads = True
 
     def _on_signal(signum, frame):
@@ -2686,11 +2365,10 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    print("serving on %s:%d" % (args.host, args.port))
-    print("input:  %s" % INPUT_DIR)
-    print("output: %s" % OUTPUT_DIR)
-    print("ffmpeg: %s" % (FFMPEG_BIN or ("未就绪：" + FFMPEG_ERROR)))
-    print("roots:  %s" % ", ".join(ROOTS))
+    _startup_log("已监听 %s:%d" % (args.host, args.port))
+    if args.host not in ("127.0.0.1", "::1", "localhost", ""):
+        _startup_log("NOTE: 当前监听非回环地址，局域网内可直接访问且无需登录。")
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

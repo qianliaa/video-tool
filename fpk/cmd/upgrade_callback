@@ -1,2 +1,20 @@
 #!/bin/bash
+# upgrade_callback 在升级解压之后执行；为已授权目录补跑一次 ACL，保证升级后仍可读写。
+LOG="${TRIM_PKGVAR}/acl.log"
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || LOG="/tmp/video-tool-acl.log"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - upgrade_callback: refresh ACL (TRIM_APPDEST=${TRIM_APPDEST})" >> "${LOG}" 2>&1
+
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+ACL_SCRIPT="${CMD_DIR}/acl_apply"
+[ -f "${ACL_SCRIPT}" ] || ACL_SCRIPT="${TRIM_APPDEST}/../cmd/acl_apply"
+if [ -f "${ACL_SCRIPT}" ]; then
+    bash "${ACL_SCRIPT}" >> "${LOG}" 2>&1
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    else
+        nohup bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    fi
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - WARN: acl_apply 缺失，跳过授权" >> "${LOG}" 2>&1
+fi
 exit 0

@@ -27,14 +27,10 @@
     seen: {},
     logId: null,
     logTimer: null,
+    logSeq: 0,
+    logHasContent: false,
     taskTimer: null,
-    updateBusy: false,
-    users: [],
-    auth: { configured: false, authenticated: false, setup: false, busy: false,
-            username: "", role: "", isAdmin: false, authFile: "", primary: false,
-            mode: "login", allowRegister: true, registerApproval: false,
-            identityNote: "", identityDetected: false, identityUsername: "",
-            primaryUsername: "" }
+    updateBusy: false
   };
 
   var VIEW_META = {
@@ -65,7 +61,7 @@
     download: "链接下载"
   };
 
-  var STATUS_LABEL = { running: "运行中", done: "已完成", failed: "失败", canceled: "已取消" };
+  var STATUS_LABEL = { queued: "排队中", running: "运行中", done: "已完成", failed: "失败", canceled: "已取消" };
 
   // ---------------------------------------------------------------- 基础
 
@@ -175,15 +171,10 @@
   function api(path, options) {
     return fetch(path, options).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
-        if (res.status === 401) {
-          var deny = new Error((data && data.error) || "未登录或登录已过期");
-          deny.unauthorized = true;
-          handleUnauthorized();
-          throw deny;
-        }
         if (!res.ok) {
           var err = new Error((data && data.error) || ("请求失败（" + res.status + "）"));
           err.status = res.status;
+          err.code = data && data.code;
           throw err;
         }
         return data;
@@ -199,431 +190,20 @@
     });
   }
 
-  // ---------------------------------------------------------------- 登录
+  // ---------------------------------------------------------------- 通用渲染
 
-  function authFetch(path, body) {
-    return fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body || {})
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.error) || ("请求失败（" + res.status + "）"));
-        return data;
-      });
-    });
-  }
-
-  function setAuthError(message) {
-    var box = $("#authError");
-    if (!box) return;
-    box.textContent = message || "";
-    box.hidden = !message;
-  }
-
-  function fillAuthHint() {
-    var hint = $("#authHint");
-    if (!hint) return;
-    var auth = state.auth;
-    var text;
-    if (!auth.configured) {
-      text = "首次注册的账号即主账号管理员，拥有用户管理权限。忘记密码可删除配置目录中的 users.json 与 sessions.json，或启动前设置 VT_RESET_AUTH=1。";
-    } else if (auth.mode === "register") {
-      text = auth.identityNote || "注册后即可使用下载与处理功能。";
-      if (auth.registerApproval) text += " 当前已开启注册审批，需管理员批准后才能登录。";
-    } else {
-      text = "忘记密码？停止应用后删除配置目录中的 users.json 与 sessions.json，或启动前设置环境变量 VT_RESET_AUTH=1，重新启动后即可重新设置管理员。";
-    }
-    hint.textContent = text;
-    hint.hidden = false;
-  }
-
-  function setAuthMode(mode) {
-    var auth = state.auth;
-    if (!auth.configured) mode = "setup";
-    if (mode === "register" && auth.configured && !auth.allowRegister) mode = "login";
-    auth.mode = mode;
-    var setup = !auth.configured;
-    var register = mode === "register";
-    var tabs = $("#authTabs");
-    if (tabs) {
-      tabs.hidden = setup;
-      $$(".auth-tab", tabs).forEach(function (btn) {
-        btn.classList.toggle("active", btn.getAttribute("data-mode") === mode);
-        if (btn.getAttribute("data-mode") === "register") btn.hidden = !auth.allowRegister;
-      });
-    }
-    $("#authTitle").textContent = setup ? "创建主账号" : register ? "注册账号" : "登录";
-    $("#authDesc").textContent = setup
-      ? "首次使用：第一个注册的账号就是主账号管理员（密码至少 8 位，需含字母和数字）"
-      : register
-        ? "填写账号与密码完成注册"
-        : "请输入账号与密码继续使用";
-    $("#authSubmit").textContent = setup ? "创建并进入" : register ? "注册" : "登录";
-    $("#authPassword").autocomplete = (setup || register) ? "new-password" : "current-password";
-    $("#authConfirmField").hidden = !(setup || register);
-    $("#authPassword").value = "";
-    $("#authConfirm").value = "";
-    $("#authRemember").checked = true;
-    var nameInput = $("#authUsername");
-    if (setup || register) {
-      var suggested = (auth.identityUsername || "").trim();
-      nameInput.value = (suggested && /^[A-Za-z0-9_.-]{2,32}$/.test(suggested))
-        ? suggested.toLowerCase() : (setup ? "admin" : "");
-      nameInput.placeholder = setup ? "admin" : "2-32 位字母、数字、_ . -";
-    } else {
-      var saved = "";
-      try { saved = localStorage.getItem("vt-user") || ""; } catch (e) {}
-      nameInput.value = saved;
-      nameInput.placeholder = "例如 admin";
-    }
-    nameInput.disabled = false;
-    fillAuthHint();
-    setAuthError("");
-    setTimeout(function () {
-      if ($("#authModal").hidden) return;
-      if (!setup && !register) $("#authPassword").focus();
-      else if (!nameInput.value) nameInput.focus();
-      else $("#authPassword").focus();
-    }, 60);
-  }
-
-  function showAuth() {
-    state.auth.authenticated = false;
-    var modal = $("#authModal");
-    if (!modal) return;
-    modal.hidden = false;
-    setAuthMode(state.auth.configured ? "login" : "setup");
-  }
-
-  function applyAuthStatus(data) {
-    data = data || {};
-    var auth = state.auth;
-    auth.configured = !!data.configured;
-    auth.setup = !auth.configured;
-    auth.authenticated = !!data.authenticated;
-    auth.username = data.username || "";
-    auth.role = data.role || "";
-    auth.isAdmin = !!data.is_admin;
-    auth.primary = !!data.primary;
-    auth.allowRegister = data.allow_register !== false;
-    auth.registerApproval = !!data.register_approval;
-    auth.identityNote = data.identity_note || "";
-    auth.identityDetected = !!data.identity_detected;
-    auth.identityUsername = data.identity_username || "";
-    auth.primaryUsername = data.primary_username || "";
-    if (data.auth_file) auth.authFile = data.auth_file;
-  }
-
-  function handleUnauthorized() {
-    stopPolling();
-    state.auth.authenticated = false;
-    if (state.logId) {
-      state.logId = null;
-      $("#logModal").hidden = true;
-    }
-    if (!$("#authModal").hidden) return;
-    showAuth();
-  }
-
-  function checkAuth() {
-    return fetch("/api/auth/status", { cache: "no-store" })
-      .then(function (res) {
-        return res.json().catch(function () { return {}; }).then(function (data) {
-          if (!res.ok) throw new Error((data && data.error) || ("访问校验失败（" + res.status + "）"));
-          return data;
-        });
-      })
-      .then(function (data) {
-        applyAuthStatus(data);
-        if (state.auth.authenticated) startApp();
-        else showAuth();
-      })
-      .catch(function (err) {
-        showAuth();
-        setAuthError("无法连接服务：" + err.message);
-      });
-  }
-
-  function submitAuth(event) {
-    event.preventDefault();
-    if (state.auth.busy) return;
-    var auth = state.auth;
-    var setup = !auth.configured;
-    var register = auth.configured && auth.mode === "register";
-    var username = ($("#authUsername").value || "").trim();
-    var password = $("#authPassword").value;
-    if (!/^[A-Za-z0-9_.-]{2,32}$/.test(username)) {
-      setAuthError("账号名需为 2-32 位字母、数字、下划线、点或短横线");
-      $("#authUsername").focus();
-      return;
-    }
-    if (password.length < 8) {
-      setAuthError("密码至少需要 8 个字符");
-      $("#authPassword").focus();
-      return;
-    }
-    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
-      setAuthError("密码需同时包含字母和数字");
-      $("#authPassword").focus();
-      return;
-    }
-    if ((setup || register) && password !== $("#authConfirm").value) {
-      setAuthError("两次输入的密码不一致");
-      $("#authConfirm").focus();
-      return;
-    }
-    state.auth.busy = true;
-    $("#authSubmit").disabled = true;
-    setAuthError("");
-    var path = setup ? "/api/auth/setup" : register ? "/api/auth/register" : "/api/auth/login";
-    authFetch(path, {
-      username: username,
-      password: password,
-      confirm: $("#authConfirm").value,
-      remember: !!$("#authRemember").checked
-    }).then(function (data) {
-      if (data && data.pending) {
-        state.auth.busy = false;
-        $("#authSubmit").disabled = false;
-        setAuthMode("login");
-        setAuthError(data.message || "注册申请已提交，请等待管理员审批");
-        toast("注册申请已提交，等待管理员审批", "success", 3000);
-        return;
-      }
-      try { localStorage.setItem("vt-user", username); } catch (e) {}
-      state.auth.busy = false;
-      state.auth.configured = true;
-      state.auth.authenticated = true;
-      state.auth.setup = false;
-      state.auth.mode = "login";
-      state.auth.username = data.username || username;
-      state.auth.role = data.role || "";
-      state.auth.isAdmin = !!data.is_admin;
-      state.auth.primary = !!data.primary;
-      $("#authSubmit").disabled = false;
-      $("#authModal").hidden = true;
-      toast(setup ? "主账号已创建" : register ? "注册成功" : "已登录", "success", 1800);
-      startApp();
-    }).catch(function (err) {
-      state.auth.busy = false;
-      $("#authSubmit").disabled = false;
-      setAuthError(err.message);
-      $("#authPassword").select();
-    });
-  }
-
-  // ---------------------------------------------------------------- 账号与用户
-
-  function logout() {
-    authFetch("/api/auth/logout", {}).catch(function () {}).then(function () {
-      state.auth.authenticated = false;
-      state.users = [];
-      stopPolling();
-      showAuth();
-      toast("已退出登录", "success", 1800);
-    });
-  }
-
-  function renderAccount() {
-    var box = $("#accountInfo");
-    if (!box) return;
-    var rows = [
-      ["当前账号", state.auth.username || "-"],
-      ["角色", state.auth.role === "admin" ? "管理员" : "普通用户"],
-      ["登录状态", state.auth.authenticated ? "已登录" : "未登录"],
-      ["账号文件", state.auth.authFile || "-"]
-    ];
-    box.innerHTML = rows.map(function (r) {
-      return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[1]) + '">' + esc(r[1]) + '</span></div>';
+  function kvHtml(rows) {
+    return (rows || []).map(function (row) {
+      var value = row[1];
+      if (value === undefined || value === null || value === "") value = "-";
+      return '<div class="kv-row"><span>' + esc(row[0]) + "</span><strong>" +
+        esc(String(value)) + "</strong></div>";
     }).join("");
-    var chip = $("#accountRole");
-    if (chip) {
-      chip.textContent = state.auth.role === "admin" ? "管理员" : "普通用户";
-      chip.className = "role-chip" + (state.auth.role === "admin" ? " admin" : "");
-    }
-    var path = $("#authFilePath");
-    if (path) path.textContent = state.auth.authFile || "users.json";
-    var note = $("#identityNote");
-    if (note) {
-      var text = "";
-      if (state.auth.primary) text = "当前账号是主账号管理员。";
-      else if (state.auth.primaryUsername) text = "当前主账号：" + state.auth.primaryUsername + "。";
-      if (state.auth.identityNote) text += (text ? " " : "") + state.auth.identityNote;
-      note.hidden = !text;
-      note.textContent = text;
-    }
   }
 
-  function renderUsers() {
-    var box = $("#userList");
-    if (!box) return;
-    var me = state.auth.username;
-    var html = state.users.map(function (u) {
-      var self = u.username === me;
-      var badges = '<span class="role-chip' + (u.role === "admin" ? " admin" : "") + '">' +
-        (u.role === "admin" ? "管理员" : "普通用户") + '</span>';
-      if (u.primary) badges += '<span class="role-chip primary">主账号</span>';
-      if (u.approved === false) badges += '<span class="user-state pending">待审批</span>';
-      badges += '<span class="user-state' + (u.enabled ? " ok" : " off") + '">' +
-        (u.enabled ? "启用" : "已停用") + '</span>';
-      if (self) badges += '<span class="user-self">当前</span>';
-      var meta = [];
-      if (u.created_via === "register") meta.push("自助注册");
-      if (u.fnos_username) meta.push("飞牛账号 " + u.fnos_username);
-      return '<div class="user-row">' +
-        '<div class="user-main"><strong>' + esc(u.username) + '</strong>' + badges +
-        (meta.length ? '<span class="user-meta">' + esc(meta.join(" · ")) + '</span>' : '') +
-        '</div>' +
-        '<div class="user-ops">' +
-        (u.approved === false ? '<button class="btn primary small" data-user-approve="' + esc(u.username) + '">批准</button>' : '') +
-        '<button class="btn ghost small" data-user-reset="' + esc(u.username) + '">重置密码</button>' +
-        '<button class="btn ghost small" data-user-toggle="' + esc(u.username) + '" data-enabled="' + (u.enabled ? "1" : "0") + '"' +
-        (self ? ' disabled title="不能停用当前账号"' : '') + '>' + (u.enabled ? "停用" : "启用") + '</button>' +
-        '<button class="btn danger small" data-user-delete="' + esc(u.username) + '"' +
-        (self ? ' disabled title="不能删除当前账号"' : '') + '>删除</button>' +
-        '</div></div>';
-    }).join("");
-    box.innerHTML = html || '<p class="hint">暂无用户</p>';
-  }
-
-  function approveUser(name) {
-    post("/api/users/update", { username: name, approved: true })
-      .then(function () {
-        toast("已批准 " + name + " 的注册申请", "success", 2200);
-        loadUsers();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function renderRegisterSettings() {
-    var card = $("#registerCard");
-    if (!card || !state.auth.isAdmin) return;
-    card.hidden = false;
-    var allow = $("#allowRegister");
-    var approval = $("#registerApproval");
-    if (allow) allow.checked = !!state.auth.allowRegister;
-    if (approval) approval.checked = !!state.auth.registerApproval;
-    var chip = $("#primaryChip");
-    if (chip) {
-      chip.textContent = "主账号：" + (state.auth.primaryUsername || "-");
-      chip.className = "role-chip primary";
-    }
-    var info = $("#registerInfo");
-    if (info) {
-      var pending = state.users.filter(function (u) { return u.approved === false; });
-      var rows = [
-        ["公开注册", state.auth.allowRegister ? "已开启" : "已关闭"],
-        ["注册审批", state.auth.registerApproval ? "需要审批" : "无需审批"],
-        ["待审批账号", pending.length ? pending.map(function (u) { return u.username; }).join("、") : "无"],
-        ["身份来源", state.auth.identityDetected ? state.auth.identityNote : "未识别飞牛账号"]
-      ];
-      info.innerHTML = rows.map(function (r) {
-        return '<div><span>' + esc(r[0]) + '</span><span title="' + esc(r[1]) + '">' + esc(r[1]) + '</span></div>';
-      }).join("");
-    }
-    var note = $("#registerIdentityNote");
-    if (note) note.textContent = state.auth.identityNote || "";
-  }
-
-  function saveRegisterSettings() {
-    post("/api/registration/settings", {
-      allow_register: !!$("#allowRegister").checked,
-      register_approval: !!$("#registerApproval").checked
-    }).then(function (data) {
-      state.auth.allowRegister = !!data.allow_register;
-      state.auth.registerApproval = !!data.register_approval;
-      toast("注册设置已保存", "success", 2000);
-      renderRegisterSettings();
-    }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function loadUsers() {
-    if (!state.auth.isAdmin) return Promise.resolve();
-    return api("/api/users").then(function (data) {
-      state.users = (data && data.users) || [];
-      renderUsers();
-      renderRegisterSettings();
-    }).catch(function (err) {
-      if (!err.unauthorized) toast("加载用户失败：" + err.message, "error", 6000);
-    });
-  }
-
-  function createUser() {
-    var username = ($("#newUserName").value || "").trim();
-    var password = $("#newUserPassword").value;
-    var role = $("#newUserRole").value;
-    if (!/^[A-Za-z0-9_.-]{2,32}$/.test(username)) {
-      toast("账号名需为 2-32 位字母、数字、下划线、点或短横线", "error", 5000);
-      return;
-    }
-    if (password.length < 8) {
-      toast("密码至少需要 8 个字符", "error", 5000);
-      return;
-    }
-    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
-      toast("密码需同时包含字母和数字", "error", 5000);
-      return;
-    }
-    post("/api/users/create", { username: username, password: password, role: role })
-      .then(function () {
-        $("#newUserName").value = "";
-        $("#newUserPassword").value = "";
-        toast("用户已创建", "success", 2000);
-        loadUsers();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function toggleUser(name, enabled) {
-    post("/api/users/update", { username: name, enabled: enabled })
-      .then(function () {
-        toast(enabled ? "已启用账号" : "已停用账号", "success", 2000);
-        loadUsers();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function resetUserPassword(name) {
-    var password = window.prompt("为账号 " + name + " 设置新密码（至少 8 位，需含字母和数字）", "");
-    if (password === null) return;
-    if (password.length < 8) { toast("密码至少需要 8 个字符", "error", 5000); return; }
-    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
-      toast("密码需同时包含字母和数字", "error", 5000); return;
-    }
-    post("/api/users/password", { username: name, password: password })
-      .then(function () {
-        toast("密码已重置，该账号需重新登录", "success", 2600);
-        loadUsers();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function deleteUser(name) {
-    if (!window.confirm("确定删除账号 " + name + "？该账号将立即失去登录权限。")) return;
-    post("/api/users/delete", { username: name })
-      .then(function () {
-        toast("账号已删除", "success", 2000);
-        loadUsers();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-  }
-
-  function applyAuthFromTools(tools) {
-    var t = tools || {};
-    if (t.username) state.auth.username = t.username;
-    if (t.role) state.auth.role = t.role;
-    state.auth.isAdmin = !!t.is_admin;
-    state.auth.primary = !!t.primary;
-    if (t.auth_file) state.auth.authFile = t.auth_file;
-    if (typeof t.allow_register === "boolean") state.auth.allowRegister = t.allow_register;
-    if (typeof t.register_approval === "boolean") state.auth.registerApproval = t.register_approval;
-    if (t.identity_note) state.auth.identityNote = t.identity_note;
-    if (t.identity_detected !== undefined) state.auth.identityDetected = !!t.identity_detected;
-    renderAccount();
-    var card = $("#usersCard");
-    if (card) card.hidden = !state.auth.isAdmin;
-    var reg = $("#registerCard");
-    if (reg) reg.hidden = !state.auth.isAdmin;
-    if (state.auth.isAdmin) {
-      renderRegisterSettings();
-      loadUsers();
-    }
+  function fmtLastSeen(sec) {
+    if (!sec) return "-";
+    try { return new Date(sec * 1000).toLocaleString(); } catch (e) { return "-"; }
   }
 
   function stopPolling() {
@@ -634,13 +214,8 @@
   }
 
   function startApp() {
-    state.auth.authenticated = true;
-    $("#authModal").hidden = true;
     loadTools()
-      .then(function (tools) {
-        applyAuthFromTools(tools);
-        return loadConfig();
-      })
+      .then(loadConfig)
       .then(loadFiles)
       .then(function () {
         processDefaults();
@@ -651,7 +226,7 @@
         updatePreviews();
       })
       .catch(function (err) {
-        if (!err || !err.unauthorized) toast("初始化失败：" + err.message, "error", 8000);
+        toast("初始化失败：" + (err && err.message ? err.message : "未知错误"), "error", 8000);
       });
     loadTasks(true);
     stopPolling();
@@ -737,6 +312,10 @@
     var setOutput = $("#setOutput");
     if (setInput && document.activeElement !== setInput) setInput.value = input;
     if (setOutput && document.activeElement !== setOutput) setOutput.value = output;
+
+    [setInput, setOutput].forEach(function (el) {
+      if (el) el.readOnly = true;
+    });
 
     var banner = $("#setupBanner");
     if (banner) {
@@ -1172,7 +751,9 @@
   }
 
   function updateTaskBadge() {
-    var n = state.tasks.filter(function (t) { return t.status === "running"; }).length;
+    var n = state.tasks.filter(function (t) {
+      return t.status === "running" || t.status === "queued";
+    }).length;
     var badge = $("#taskBadge");
     if (!badge) return;
     badge.textContent = n;
@@ -1196,7 +777,7 @@
           '<span class="task-time">' + esc(fmtDate(t.created)) + '</span>' +
           '<span class="task-actions">' +
             '<button class="btn ghost small" data-log="' + esc(t.id) + '">日志</button>' +
-            (t.status === "running" ? '<button class="btn danger small" data-cancel="' + esc(t.id) + '">取消</button>' : '') +
+            ((t.status === "running" || t.status === "queued") ? '<button class="btn danger small" data-cancel="' + esc(t.id) + '">取消</button>' : '') +
           '</span>' +
         '</div>' +
         '<div class="progress"><div class="progress-bar' + (unknown ? ' unknown' : '" style="width:' + pct + '%') + '"></div></div>';
@@ -1212,7 +793,8 @@
       state.tasks = data.tasks || [];
       state.tasks.forEach(function (t) {
         var before = prev[t.id];
-        if (before === "running" && t.status !== "running") {
+        if ((before === "running" || before === "queued") &&
+            (t.status === "done" || t.status === "failed" || t.status === "canceled")) {
           if (t.status === "done") {
             toast(taskLabel(t) + " 已完成", "success");
             if (state.logId !== t.id) loadFiles();
@@ -1232,11 +814,13 @@
     });
   }
 
-  function startTask(action, params) {
+  function startTask(action, params, options) {
+    var opts = options || {};
     return post("/api/task", { action: action, params: params }).then(function (data) {
-      toast("任务已启动", "success", 2200);
+      // 所有任务提交后都不弹日志遮罩：留在当前页可继续添加，日志在任务页手动查看。
+      toast(opts.toast || "任务已加入队列，可继续添加", "success", 2200);
       loadTasks(true);
-      openLog(data.task);
+      if (opts.onSuccess) opts.onSuccess(data);
       return data;
     }).catch(function (err) {
       toast(err.message, "error", 6000);
@@ -1257,6 +841,8 @@
 
   function openLog(id) {
     state.logId = id;
+    state.logSeq = 0;
+    state.logHasContent = false;
     $("#logModal").hidden = false;
     $("#logBody").textContent = "正在读取日志…";
     $("#logProgress").style.width = "0%";
@@ -1268,6 +854,8 @@
 
   function closeLog() {
     state.logId = null;
+    state.logSeq = 0;
+    state.logHasContent = false;
     $("#logModal").hidden = true;
     clearInterval(state.logTimer);
     state.logTimer = null;
@@ -1277,12 +865,23 @@
   function pollLog() {
     var id = state.logId;
     if (!id) return;
-    api("/api/log/" + encodeURIComponent(id)).then(function (data) {
+    var since = state.logSeq || 0;
+    // 只拉取新增日志行，长任务不再每秒传输完整日志（最多 4000 行）。
+    api("/api/log/" + encodeURIComponent(id) + "?since=" + since).then(function (data) {
       if (state.logId !== id) return;
       var box = $("#logBody");
       var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
-      var text = (data.log || []).join("\n");
-      box.textContent = text || "等待输出…";
+      var prev = state.logHasContent && box.textContent ? box.textContent.split("\n") : [];
+      var lines = data.log || [];
+      var all = prev.concat(lines);
+      if (all.length > 4000) all = ["... 日志过长，已截断 ..."].concat(all.slice(-3999));
+      if (all.length) {
+        state.logHasContent = true;
+        box.textContent = all.join("\n");
+      } else {
+        box.textContent = "等待输出…";
+      }
+      state.logSeq = Number(data.next != null ? data.next : since) || 0;
       if (nearBottom) box.scrollTop = box.scrollHeight;
       var unknown = Number(data.progress) < 0;
       var pct = unknown ? 0 : Math.max(0, Math.min(100, Number(data.progress) || 0));
@@ -1296,8 +895,9 @@
       $("#logSub").textContent = (STATUS_LABEL[data.status] || data.status) +
         " · " + (unknown ? taskStat(data) : pct.toFixed(0) + "%") + " · " + id.slice(0, 8);
       var cancelBtn = $("#logCancel");
-      cancelBtn.hidden = data.status !== "running";
-      if (data.status !== "running") {
+      var active = data.status === "running" || data.status === "queued";
+      cancelBtn.hidden = !active;
+      if (!active) {
         clearInterval(state.logTimer);
         state.logTimer = null;
         loadTasks(true);
@@ -1311,32 +911,35 @@
 
   // ---------------------------------------------------------------- 目录选择
 
+  // 目录只来自 fnOS 授权目录：先展示授权根列表，再逐层浏览，不接受手填路径。
+
   function openPicker(mode) {
     state.picker.mode = mode;
     $("#pickerTitle").textContent = mode === "output" ? "选择输出目录" : "选择输入目录";
     $("#pickerModal").hidden = false;
     $("#pickerNewName").value = "";
-    var start = mode === "output" ? state.config.output_dir : state.config.input_dir;
-    $("#pickerPathInput").value = start || "";
-    browseTo(start || "/");
+    browseTo("");
   }
 
   function browseTo(path) {
-    if (!path) {
-      $("#pickerList").innerHTML = '<div class="picker-empty">没有可浏览的目录</div>';
-      return;
-    }
+    var url = path ? "/api/browse?path=" + encodeURIComponent(path) : "/api/browse";
     $("#pickerList").innerHTML = '<div class="picker-empty">加载中…</div>';
-    api("/api/browse?path=" + encodeURIComponent(path)).then(function (data) {
-      state.picker.path = data.path;
+    api(url).then(function (data) {
+      state.picker.path = data.path || "";
       state.picker.parent = data.parent;
       state.roots = data.roots || state.roots;
-      $("#pickerPath").textContent = data.path;
-      $("#pickerPath").title = data.path;
-      $("#pickerPathInput").value = data.path;
-      $("#pickerUp").disabled = !data.parent;
+      $("#pickerPath").textContent = data.path || "已授权目录";
+      $("#pickerPath").title = data.path || "已授权目录";
+      $("#pickerUp").disabled = data.parent === null || data.parent === undefined;
+      $("#pickerChoose").disabled = !data.path;
+      $("#pickerNewName").disabled = !data.path;
+      $("#pickerMkdir").disabled = !data.path;
       var box = $("#pickerList");
       box.innerHTML = "";
+      if (data.error) {
+        box.innerHTML = '<div class="picker-empty">' + esc(data.error) + '</div>';
+        return;
+      }
       (data.dirs || []).forEach(function (dir) {
         var btn = document.createElement("button");
         btn.className = "picker-item";
@@ -1347,24 +950,13 @@
         btn.addEventListener("click", function () { browseTo(dir.path); });
         box.appendChild(btn);
       });
-      if (data.error) {
-        box.innerHTML = '<div class="picker-empty">' + esc(data.error) + '</div>';
-      } else if (!(data.dirs || []).length) {
+      if (!(data.dirs || []).length) {
         box.innerHTML = '<div class="picker-empty">该目录下没有子文件夹</div>';
       }
     }).catch(function (err) {
       $("#pickerList").innerHTML = '<div class="picker-empty">' + esc(err.message) + '</div>';
       toast(err.message, "error", 6000);
     });
-  }
-
-  function gotoPickerPath() {
-    var raw = ($("#pickerPathInput").value || "").trim();
-    if (!raw) { toast("请填写目录路径", "error"); return; }
-    post("/api/checkdir", { path: raw, purpose: state.picker.mode }).then(function (data) {
-      state.roots = data.roots || state.roots;
-      browseTo(data.path);
-    }).catch(function (err) { toast(err.message, "error", 6000); });
   }
 
   function mkdirInPicker() {
@@ -1384,7 +976,7 @@
 
   function choosePickerDir() {
     var path = state.picker.path;
-    if (!path) return;
+    if (!path) { toast("请先从已授权目录中选择一个文件夹", "error"); return; }
     var payload = {
       input_dir: state.config.input_dir,
       output_dir: state.config.output_dir
@@ -1528,7 +1120,15 @@
     } else {
       params.quality = $("#dlQuality").value;
     }
-    startTask("download", params);
+    startTask("download", params, {
+      toast: "已加入下载队列，可继续添加",
+      onSuccess: function () {
+        $("#dlUrl").value = "";
+        $("#dlFilename").value = "";
+        updatePreviews();
+        $("#dlUrl").focus();
+      }
+    });
   }
 
   function runCustom() {
@@ -1695,39 +1295,10 @@
   }
 
   function bindSettings() {
-    $("#setSave").addEventListener("click", function () {
-      post("/api/config", {
-        input_dir: ($("#setInput").value || "").trim(),
-        output_dir: ($("#setOutput").value || "").trim()
-      }).then(function (data) {
-        applyConfig(data);
-        renderDirs();
-        toast("目录设置已保存", "success");
-        loadFiles();
-      }).catch(function (err) { toast(err.message, "error", 6000); });
-    });
-    $("#authLogout").addEventListener("click", logout);
-    if ($("#saveRegisterSettings")) {
-      $("#saveRegisterSettings").addEventListener("click", saveRegisterSettings);
-    }
-    $("#usersRefresh").addEventListener("click", function () { loadUsers(); });
-    $("#newUserCreate").addEventListener("click", createUser);
-    $("#newUserPassword").addEventListener("keydown", function (e) {
-      if (e.key === "Enter") { e.preventDefault(); createUser(); }
-    });
-    $("#userList").addEventListener("click", function (e) {
-      var approve = e.target.closest("[data-user-approve]");
-      if (approve) { approveUser(approve.getAttribute("data-user-approve")); return; }
-      var reset = e.target.closest("[data-user-reset]");
-      if (reset) { resetUserPassword(reset.getAttribute("data-user-reset")); return; }
-      var toggle = e.target.closest("[data-user-toggle]");
-      if (toggle) {
-        toggleUser(toggle.getAttribute("data-user-toggle"),
-                   toggle.getAttribute("data-enabled") !== "1");
-        return;
-      }
-      var del = e.target.closest("[data-user-delete]");
-      if (del) deleteUser(del.getAttribute("data-user-delete"));
+    // 目录只能通过「浏览」从授权目录中选择，输入框保持只读。
+    ["#setInput", "#setOutput"].forEach(function (sel) {
+      var el = $(sel);
+      if (el) el.readOnly = true;
     });
   }
 
@@ -1739,14 +1310,12 @@
     $("#pickerClose").addEventListener("click", function () { $("#pickerModal").hidden = true; });
     $("#pickerCancel").addEventListener("click", function () { $("#pickerModal").hidden = true; });
     $("#pickerUp").addEventListener("click", function () {
-      if (state.picker.parent) browseTo(state.picker.parent);
+      if (state.picker.parent !== null && state.picker.parent !== undefined) {
+        browseTo(state.picker.parent);
+      }
     });
     $("#pickerChoose").addEventListener("click", choosePickerDir);
     $("#pickerMkdir").addEventListener("click", mkdirInPicker);
-    $("#pickerGo").addEventListener("click", gotoPickerPath);
-    $("#pickerPathInput").addEventListener("keydown", function (e) {
-      if (e.key === "Enter") { e.preventDefault(); gotoPickerPath(); }
-    });
     $("#pickerNewName").addEventListener("keydown", function (e) {
       if (e.key === "Enter") { e.preventDefault(); mkdirInPicker(); }
     });
@@ -1770,11 +1339,9 @@
     $("#refreshAll").addEventListener("click", function () {
       loadTools().then(loadFiles).then(function () { toast("已刷新", "success", 1600); });
     });
-    $("#sideSettings").addEventListener("click", function () { setView("settings"); });
     $$(".modal-backdrop").forEach(function (backdrop) {
       backdrop.addEventListener("mousedown", function (e) {
         if (e.target !== backdrop) return;
-        if (backdrop.id === "authModal") return;
         if (backdrop.id === "logModal") closeLog();
         else backdrop.hidden = true;
       });
@@ -1812,20 +1379,12 @@
     bindPicker();
     bindLog();
     bindGlobal();
-    $("#authForm").addEventListener("submit", submitAuth);
-    var authTabs = $("#authTabs");
-    if (authTabs) {
-      authTabs.addEventListener("click", function (e) {
-        var btn = e.target.closest(".auth-tab");
-        if (btn) setAuthMode(btn.getAttribute("data-mode"));
-      });
-    }
 
     var initial = (window.location.hash || "").replace(/^#/, "");
     setView(VIEW_META[initial] ? initial : "merge");
 
     updateConvertCopyState();
-    checkAuth();
+    startApp();
   }
 
   if (document.readyState === "loading") {

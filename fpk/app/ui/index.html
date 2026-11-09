@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.6.0">
+<link rel="stylesheet" href="style.css?v=1.7.3">
 </head>
 <body>
 <div class="app">
@@ -66,10 +66,6 @@
         <span>设置</span>
       </button>
     </nav>
-
-    <div class="side-foot">
-      <button class="btn ghost small block" id="sideSettings">目录与设置</button>
-    </div>
   </aside>
 
   <main class="main">
@@ -410,7 +406,7 @@
           <label for="dlUrl">视频地址</label>
           <input id="dlUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false"
                  placeholder="https://… 直链 / m3u8 / mpd / 视频页面">
-          <p class="hint">支持公开直链、HLS(m3u8)、DASH(mpd) 以及页面内的媒体地址。需要登录或加密解析的站点不支持。</p>
+          <p class="hint">支持公开直链、HLS(m3u8)、DASH(mpd) 以及页面内的媒体地址。需要登录或加密解析的站点不支持。可连续添加多个下载任务，任务会并行执行；提交后地址栏自动清空。</p>
         </div>
 
         <div class="form-grid">
@@ -487,7 +483,7 @@
     <section class="view" data-view="advanced" hidden>
       <div class="card">
         <div class="card-head"><h2>自定义 ffmpeg 命令</h2></div>
-        <p class="hint" style="margin-top:0">参数中可使用 <code>{input}</code> 和 <code>{output}</code> 占位符；不填写时自动补全输入与输出。命令由服务器执行，请只运行可信参数。</p>
+        <p class="hint" style="margin-top:0">参数中可使用 <code>{input}</code> 和 <code>{output}</code> 占位符；不填写时自动补全输入与输出。出于安全考虑，只支持常用编码/滤镜选项，不允许额外输入、额外输出、协议地址与绝对路径。</p>
         <div class="form-grid">
           <div class="field">
             <label for="customFile">输入文件</label>
@@ -511,7 +507,10 @@
     <section class="view" data-view="tasks" hidden>
       <div class="card">
         <div class="card-head">
-          <h2>任务列表</h2>
+          <div>
+            <h2>任务列表</h2>
+            <p class="card-sub">提交任务后可继续添加；点击「日志」查看进度，多个任务会并行执行</p>
+          </div>
           <button class="btn ghost small" id="tasksRefresh">刷新</button>
         </div>
         <div id="taskList" class="task-list"></div>
@@ -530,22 +529,21 @@
           <div class="field">
             <label for="setInput">输入目录（读取媒体文件）</label>
             <div class="input-with-btn">
-              <input id="setInput" type="text" placeholder="/vol1/1000/视频" spellcheck="false">
+              <input id="setInput" type="text" placeholder="点击右侧「浏览」选择" readonly spellcheck="false">
               <button class="btn ghost" data-pick="input">浏览</button>
             </div>
           </div>
           <div class="field">
             <label for="setOutput">输出目录（保存处理结果）</label>
             <div class="input-with-btn">
-              <input id="setOutput" type="text" placeholder="/vol1/1000/输出" spellcheck="false">
+              <input id="setOutput" type="text" placeholder="点击右侧「浏览」选择" readonly spellcheck="false">
               <button class="btn ghost" data-pick="output">浏览</button>
             </div>
           </div>
-          <button class="btn primary block" id="setSave">保存目录设置</button>
-          <p class="hint">可直接粘贴「文件管理」中复制的原始路径，例如 <code>/vol1/1000/视频</code>。保存时会自动检查读写权限。</p>
+          <p class="hint">点击「浏览」从已授权目录中选择。输入与输出<b>可以是同一目录</b>；同名输出文件会自动重命名，不会覆盖原文件。选择时自动检查读写权限。</p>
           <div class="notice">
             <strong>在应用里看不到文件夹？</strong>
-            <p>先到 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」添加并授权文件夹，再把该文件夹的原始路径粘贴到上方。应用不再使用自身目录作为输入输出。</p>
+            <p>先到 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」添加并授权文件夹，然后回到应用点击「浏览」重新打开即可。授权变更后无需重启应用。</p>
           </div>
         </div>
 
@@ -560,71 +558,6 @@
             <li>下载使用 ffmpeg 原生能力，支持直链、HLS、DASH 与页面公开地址。</li>
           </ul>
         </div>
-      </div>
-
-      <div class="card settings-more" id="accountCard">
-        <div class="card-head">
-          <h2>账号</h2>
-          <span class="role-chip" id="accountRole">-</span>
-        </div>
-        <div class="kv" id="accountInfo"></div>
-        <p class="hint" id="identityNote" hidden></p>
-        <div class="account-actions">
-          <button class="btn danger small" id="authLogout">退出登录</button>
-        </div>
-        <div class="notice">
-          <strong>忘记密码</strong>
-          <p>停止应用后删除配置目录中的 <code id="authFilePath">users.json</code> 与 <code>sessions.json</code>，重新启动即可重新设置管理员；或在启动前设置环境变量 <code>VT_RESET_AUTH=1</code>。</p>
-        </div>
-      </div>
-
-      <div class="card settings-more" id="registerCard" hidden>
-        <div class="card-head">
-          <h2>注册与主账号</h2>
-          <span class="role-chip" id="primaryChip">-</span>
-        </div>
-        <div class="kv" id="registerInfo"></div>
-        <label class="switch-row">
-          <input type="checkbox" id="allowRegister">
-          <span class="switch"></span>
-          <div><strong>允许公开注册</strong><small>关闭后只能由管理员在下方「用户管理」中创建账号</small></div>
-        </label>
-        <label class="switch-row">
-          <input type="checkbox" id="registerApproval">
-          <span class="switch"></span>
-          <div><strong>注册需要审批</strong><small>开启后新注册账号需管理员批准才能登录</small></div>
-        </label>
-        <p class="hint" id="registerIdentityNote"></p>
-        <p class="hint">主账号说明：飞牛主账号能通过官方统一网关下发的 <code>X-Trim-Username</code> / <code>X-Trim-Userid</code> / <code>X-Trim-Isadmin</code> 请求头识别；本应用使用端口服务入口，官方文档明确端口服务不携带 NAS 登录态，因此实际拿不到飞牛账号，按「首个完成注册的账号为主账号」处理，不伪装成已识别。README 中同样写明了该限制。</p>
-        <button class="btn ghost small" id="saveRegisterSettings">保存注册设置</button>
-      </div>
-
-      <div class="card settings-more" id="usersCard" hidden>
-        <div class="card-head">
-          <h2>用户管理</h2>
-          <button class="btn ghost small" id="usersRefresh">刷新</button>
-        </div>
-        <div class="user-list" id="userList"></div>
-        <h3 class="sub-title">新增用户</h3>
-        <div class="form-grid">
-          <div class="field">
-            <label for="newUserName">账号名</label>
-            <input id="newUserName" type="text" placeholder="例如 viewer" maxlength="32" spellcheck="false" autocomplete="off">
-          </div>
-          <div class="field">
-            <label for="newUserPassword">密码</label>
-            <input id="newUserPassword" type="password" placeholder="至少 8 位，需含字母和数字" maxlength="128" autocomplete="new-password">
-          </div>
-          <div class="field">
-            <label for="newUserRole">角色</label>
-            <select id="newUserRole">
-              <option value="user">普通用户</option>
-              <option value="admin">管理员</option>
-            </select>
-          </div>
-        </div>
-        <button class="btn primary block" id="newUserCreate">新增用户</button>
-        <p class="hint">账号名支持 2-32 位字母、数字、下划线、点或短横线；密码至少 8 位且需同时包含字母和数字。普通用户可使用下载与处理功能，但看不到用户管理；主账号不可删除或停用。</p>
       </div>
 
       <div class="card settings-more">
@@ -689,47 +622,13 @@
       </button>
       <button class="sheet-item" data-view="settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.73.85.3.2.66.3 1.02.3H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span>目录与设置</span>
+        <span>设置</span>
       </button>
     </div>
   </div>
 </div>
 
 <div class="toasts" id="toasts"></div>
-
-<!-- 登录 / 注册 / 首次创建主账号 -->
-<div class="modal-backdrop" id="authModal" hidden>
-  <div class="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
-    <div class="modal-head">
-      <div>
-        <h2 id="authTitle">登录</h2>
-        <p class="log-sub" id="authDesc">请输入账号与密码</p>
-      </div>
-    </div>
-    <div class="auth-tabs" id="authTabs" hidden>
-      <button type="button" class="auth-tab active" data-mode="login">登录</button>
-      <button type="button" class="auth-tab" data-mode="register">注册</button>
-    </div>
-    <form id="authForm">
-      <div class="field">
-        <label for="authUsername">账号</label>
-        <input id="authUsername" type="text" autocomplete="username" placeholder="admin" maxlength="32" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="authPassword">密码</label>
-        <input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128" placeholder="至少 8 位，需含字母和数字" required>
-      </div>
-      <div class="field" id="authConfirmField" hidden>
-        <label for="authConfirm">确认密码</label>
-        <input id="authConfirm" type="password" autocomplete="new-password" maxlength="128" placeholder="再次输入密码">
-      </div>
-      <label class="check-row" id="authRememberRow"><input id="authRemember" type="checkbox" checked> 记住我（关闭浏览器后仍保持登录）</label>
-      <p class="auth-error" id="authError" hidden></p>
-      <button class="btn primary block" id="authSubmit" type="submit">登录</button>
-    </form>
-    <p class="auth-hint" id="authHint">忘记密码？停止应用后删除配置目录中的 users.json 与 sessions.json，或启动前设置环境变量 VT_RESET_AUTH=1，重新启动后即可重新设置管理员。</p>
-  </div>
-</div>
 
 <!-- 目录选择 -->
 <div class="modal-backdrop" id="pickerModal" hidden>
@@ -738,11 +637,7 @@
       <h2 id="pickerTitle">选择目录</h2>
       <button class="icon-btn" id="pickerClose" title="关闭">×</button>
     </div>
-    <div class="picker-goto">
-      <input id="pickerPathInput" type="text" placeholder="粘贴完整路径，如 /vol1/1000/视频" spellcheck="false">
-      <button class="btn ghost small" id="pickerGo">前往</button>
-    </div>
-    <p class="picker-hint">看不到目标文件夹时，直接从「文件管理」复制原始路径粘贴到这里。</p>
+    <p class="picker-hint">先在 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」中授权文件夹，再从下方列表逐层选择。</p>
     <div class="picker-path">
       <button class="icon-btn" id="pickerUp" title="上一级">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
@@ -779,6 +674,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.6.0"></script>
+<script src="app.js?v=1.7.3"></script>
 </body>
 </html>

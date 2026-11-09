@@ -52,5 +52,23 @@ fi
 
 log "downloader: ffmpeg native (no yt-dlp)"
 
+# 为已在「系统设置 › 应用 › 视频助手 › 访问权限」中授权的目录补齐读写 ACL。
+# 未授权时脚本会记录 0 个目录；用户后续授权时由 config_callback 自动补跑。
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+ACL_SCRIPT="${CMD_DIR}/acl_apply"
+[ -f "${ACL_SCRIPT}" ] || ACL_SCRIPT="${TRIM_APPDEST}/../cmd/acl_apply"
+if [ -f "${ACL_SCRIPT}" ]; then
+    log "acl: quick pass"
+    bash "${ACL_SCRIPT}" >> "${LOG}" 2>&1
+    log "acl: background full pass started"
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    else
+        nohup bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    fi
+else
+    log "WARN: acl_apply 缺失，跳过自动授权"
+fi
+
 log "=== install_callback done ==="
 exit 0

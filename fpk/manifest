@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.6.0
+version               = 1.7.3
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 改为用户自助注册：飞牛用户可自行注册账号密码登录，首个完成注册的账号成为主账号管理员并获得用户管理面板，其余为普通用户；新增注册开关与注册审批，主账号不可删除/停用/降级，密码强度校验（至少 8 位且含字母和数字），重名与非法账号名明确报错，登录失败限速，记住登录与会话持久化沿用上一版；普通用户看不到用户管理且调用用户接口返回 403；身份排查结论：fnOS 统一网关会下发 X-Trim-Username/X-Trim-Userid/X-Trim-Isadmin，但本应用为端口服务入口，官方文档明确端口服务与 NAS 登录态无关，实际拿不到飞牛账号，故不伪装识别，按首个注册者为主账号；合并页输出文件名改为自动识别输入文件名公共部分并预填，去掉下拉控件并修复溢出；原有任务、下载、HLS 进度、检查更新与发布者信息保持不变，不增加 Host 白名单
+changelog             = 1.7.3：移除侧边栏底部与「设置」导航重复的「目录与设置」按钮及其事件与样式；移动端「更多」面板里的设置项文案统一为「设置」。其余与 1.7.2 一致。
 platform              = x86
 source                = thirdparty
 maintainer            = 千里
@@ -12,3 +12,4 @@ distributor_url       = https://github.com/qianliaa/video-tool
 desktop_uidir         = ui
 desktop_applaunchname = video-tool.Application
 install_dep_apps      = python311
+disable_authorization_path = false

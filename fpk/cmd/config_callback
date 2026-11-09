@@ -1,2 +1,36 @@
 #!/bin/bash
+# fnOS 在用户变更“应用可访问目录 / 数据共享”后执行本脚本（config 流程）。
+# 把 TRIM_DATA_ACCESSIBLE_PATHS / TRIM_DATA_SHARE_PATHS 落盘，运行中的服务按 mtime 即时刷新，
+# 不必重启应用即可看到新授权的目录。
+VAR="${TRIM_PKGVAR:-}"
+[ -n "${VAR}" ] || exit 0
+mkdir -p "${VAR}" 2>/dev/null || exit 0
+
+write_paths() {
+    local dest="$1"
+    local raw="$2"
+    local tmp="${dest}.tmp"
+    : > "${tmp}" 2>/dev/null || return 0
+    local IFS=':'
+    local p
+    for p in ${raw}; do
+        [ -n "${p}" ] && printf '%s\n' "${p}" >> "${tmp}"
+    done
+    mv -f "${tmp}" "${dest}" 2>/dev/null
+}
+
+write_paths "${VAR}/accessible_paths" "${TRIM_DATA_ACCESSIBLE_PATHS}"
+write_paths "${VAR}/share_paths" "${TRIM_DATA_SHARE_PATHS}"
+
+# 授权目录变更后立即补齐 ACL：quick 同步保证顶层可写，full 后台递归补齐已有文件。
+CMD_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+ACL_SCRIPT="${CMD_DIR}/acl_apply"
+if [ -f "${ACL_SCRIPT}" ]; then
+    bash "${ACL_SCRIPT}" >> "${VAR}/acl.log" 2>&1
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    else
+        nohup bash "${ACL_SCRIPT}" --full >/dev/null 2>&1 &
+    fi
+fi
 exit 0

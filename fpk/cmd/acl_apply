@@ -1,0 +1,78 @@
+#!/bin/bash
+# 只为 fnOS「应用 › 访问权限」中已授权的目录补齐应用运行用户的读写 ACL。
+# 不再遍历 /vol*/ 全盘授权：界面只展示授权目录，文件系统权限也随之收窄。
+# install_callback / upgrade_callback / config_callback 以 root 身份调用：
+#   先执行快速授权（顶层目录即时可读写，并设置默认 ACL 让新文件继承），
+#   再由调用方后台启动 --full 递归补齐已有文件。
+# 手动补跑（NAS 本机 SSH，root）：
+#   bash /var/apps/video-tool/cmd/acl_apply --full
+
+PKG_USER="${TRIM_USERNAME:-video-tool}"
+PKGVAR="${TRIM_PKGVAR:-/tmp}"
+LOG_FILE="${PKGVAR}/acl.log"
+MODE="quick"
+[ "$1" = "--full" ] && MODE="full"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null; }
+
+if ! command -v setfacl >/dev/null 2>&1; then
+    log "ERROR: setfacl 不存在（缺少 acl 工具），无法自动授权；应用按安装时的默认权限运行"
+    exit 1
+fi
+if ! id "${PKG_USER}" >/dev/null 2>&1; then
+    log "ERROR: 应用运行用户不存在：${PKG_USER}"
+    exit 1
+fi
+
+log "ACL start: user=${PKG_USER} mode=${MODE}"
+
+grant_dir() {
+    local target="$1"
+    [ -d "${target}" ] || return 0
+    # 顶层：立即可读写；默认 ACL 让后续新建的文件/目录自动继承。
+    if ! setfacl -m "u:${PKG_USER}:rwx" "${target}" 2>/dev/null; then
+        log "WARN: 顶层 setfacl 失败：${target}"
+    fi
+    setfacl -m "d:u:${PKG_USER}:rwx" "${target}" 2>/dev/null
+    if [ "${MODE}" = "full" ]; then
+        # 递归补齐已有文件：rwX 只在目录上附加执行位，避免给普通文件加 x。
+        setfacl -R -m "u:${PKG_USER}:rwX" "${target}" 2>/dev/null
+        find "${target}" -type d -exec setfacl -m "d:u:${PKG_USER}:rwX" {} + 2>/dev/null
+    fi
+}
+
+# 只收集 fnOS 显式授权的目录：config_callback 落盘文件优先，
+# 其次回落到生命周期环境变量（首次安装、尚未执行过 config 流程时）。
+TARGETS=()
+collect_env() {
+    local raw="$1"
+    local IFS=':'
+    local p
+    for p in ${raw}; do
+        [ -n "${p}" ] && TARGETS+=("${p}")
+    done
+}
+for f in "${PKGVAR}/accessible_paths" "${PKGVAR}/share_paths"; do
+    if [ -f "${f}" ]; then
+        while IFS= read -r line; do
+            [ -n "${line}" ] && TARGETS+=("${line}")
+        done < "${f}"
+    fi
+done
+if [ ${#TARGETS[@]} -eq 0 ]; then
+    collect_env "${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+    collect_env "${TRIM_DATA_SHARE_PATHS:-}"
+fi
+
+count=0
+for target in "${TARGETS[@]}"; do
+    if [ ! -d "${target}" ]; then
+        log "WARN: 授权目录不存在：${target}"
+        continue
+    fi
+    grant_dir "${target}"
+    count=$((count + 1))
+done
+
+log "ACL done: ${count} authorized dirs, mode=${MODE}"
+exit 0

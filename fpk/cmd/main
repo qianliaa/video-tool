@@ -1,14 +1,25 @@
 #!/bin/bash
-LOG_FILE="${TRIM_PKGVAR}/info.log"
-PID_FILE="${TRIM_PKGVAR}/app.pid"
+PKGVAR="${TRIM_PKGVAR:-}"
+if [ -z "${PKGVAR}" ]; then
+    PKGVAR="/tmp/video-tool-pkgvar"
+fi
+mkdir -p "${PKGVAR}" 2>/dev/null
+LOG_FILE="${PKGVAR}/info.log"
+if [ ! -w "${PKGVAR}" ]; then
+    LOG_FILE="/tmp/video-tool-info.log"
+fi
+PID_FILE="${PKGVAR}/app.pid"
 
 SERVER_DIR="${TRIM_APPDEST}/server"
 ENTRY="${SERVER_DIR}/app.py"
 
-mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
-
 log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
 check_process() { kill -0 "$1" 2>/dev/null; }
+is_app_pid() {
+    # PID 文件可能被复用；有 /proc 时确认命令行里确实是 app.py
+    [ -r "/proc/$1/cmdline" ] || return 0
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "app.py"
+}
 
 PYBIN=""
 for c in /var/apps/python311/target/bin/python3 \
@@ -23,34 +34,166 @@ status() {
     if [ -f "${PID_FILE}" ]; then
         local pid
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-        if check_process "${pid}"; then return 0; else rm -f "${PID_FILE}"; fi
+        if check_process "${pid}" && is_app_pid "${pid}"; then return 0; else rm -f "${PID_FILE}"; fi
     fi
     return 1
 }
 
+port_free() {
+    # 用 Python 实际 bind 一次，能发现 127.0.0.1 / 0.0.0.0 / 指定地址上的占用
+    "$PYBIN" - "$1" "$2" 2>&1 <<'PY'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+    # Windows 上 SO_REUSEADDR 会允许端口被重复绑定，必须用独占模式才能测出占用
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+else:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind((host, port))
+except OSError as exc:
+    print(exc)
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+port_reachable() {
+    "$PYBIN" - "$1" "$2" 2>/dev/null <<'PY'
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+for _ in range(6):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect((host, port))
+        sys.exit(0)
+    except OSError:
+        time.sleep(0.5)
+    finally:
+        s.close()
+sys.exit(1)
+PY
+}
+
 start_process() {
     if status; then log_msg "already running"; return 0; fi
-    log_msg "Starting process ..."
+    log_msg "=== start ==="
     log_msg "TRIM_APPDEST=${TRIM_APPDEST}"
+    log_msg "TRIM_PKGVAR=${TRIM_PKGVAR}"
+    log_msg "LOG_FILE=${LOG_FILE}"
     log_msg "PYBIN=${PYBIN}"
-    log_msg "ENTRY=${ENTRY}"
 
-    if [ -z "${PYBIN}" ] || [ ! -f "${ENTRY}" ]; then
-        log_msg "ERROR: python or app.py missing"
+    if [ -z "${PYBIN}" ] || [ ! -x "${PYBIN}" ]; then
+        log_msg "ERROR: 未找到可用的 python3（需要 Python 3.8 及以上）"
+        return 1
+    fi
+    if [ ! -d "${SERVER_DIR}" ] || [ ! -f "${ENTRY}" ]; then
+        log_msg "ERROR: 服务文件缺失：${ENTRY}"
+        return 1
+    fi
+    if [ ! -r "${ENTRY}" ]; then
+        log_msg "ERROR: 服务文件不可读：${ENTRY}（检查 app.tgz 解压权限）"
         return 1
     fi
 
-    cd "${SERVER_DIR}" || { log_msg "ERROR: cd failed"; return 1; }
-    PORT=18080 \
-        "${PYBIN}" "${ENTRY}" --host 0.0.0.0 --port 18080 >> "${LOG_FILE}" 2>&1 &
+    PYVER="$("${PYBIN}" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null)"
+    if ! "${PYBIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+        log_msg "ERROR: Python 版本过低，需要 3.8 及以上，当前为 ${PYVER:-unknown}"
+        return 1
+    fi
+    log_msg "python OK: ${PYBIN} (${PYVER})"
+
+    if ! "${PYBIN}" -c 'import http.server, hashlib, hmac, secrets, urllib.request' 2>/dev/null; then
+        log_msg "ERROR: Python 标准库依赖缺失（http.server/hashlib/hmac/secrets/urllib）"
+        return 1
+    fi
+    if ! "${PYBIN}" -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "${ENTRY}" 2>&1; then
+        log_msg "ERROR: app.py 语法检查失败，见上方输出"
+        return 1
+    fi
+    log_msg "app.py syntax OK"
+
+    for d in "${PKGVAR}" "${PKGVAR}/accounts" "${PKGVAR}/lists"; do
+        mkdir -p "${d}" 2>/dev/null
+        if ! touch "${d}/.write-test" 2>/dev/null; then
+            log_msg "ERROR: 数据目录不可写：${d}"
+            return 1
+        fi
+        rm -f "${d}/.write-test" 2>/dev/null
+    done
+    log_msg "data dirs OK: ${PKGVAR}"
+
+    if FFMPEG_BIN="$(command -v ffmpeg 2>/dev/null)" && [ -n "${FFMPEG_BIN}" ]; then
+        log_msg "ffmpeg: ${FFMPEG_BIN} ($("${FFMPEG_BIN}" -version 2>/dev/null | head -n 1))"
+    else
+        log_msg "WARN: 未找到系统 ffmpeg，视频处理任务会失败；请在飞牛安装 ffmpeg 后重启"
+    fi
+    if command -v ffprobe >/dev/null 2>&1; then
+        log_msg "ffprobe: $(command -v ffprobe)"
+    else
+        log_msg "WARN: 未找到 ffprobe，媒体时长/编码识别会失败；请安装完整的 ffmpeg"
+    fi
+
+    # 目录权限自检：确认当前运行用户能写至少一个已授权目录。
+    log_msg "run user: ${TRIM_RUN_USERNAME:-unknown} (package user: ${TRIM_USERNAME:-video-tool})"
+    if command -v setfacl >/dev/null 2>&1; then
+        log_msg "setfacl: $(command -v setfacl)"
+    else
+        log_msg "WARN: setfacl 不存在，授权目录的 ACL 无法自动补齐"
+    fi
+    ACL_OK=""
+    for f in "${TRIM_PKGVAR:-/tmp}/accessible_paths" "${TRIM_PKGVAR:-/tmp}/share_paths"; do
+        [ -f "${f}" ] || continue
+        while IFS= read -r d; do
+            [ -n "${d}" ] || continue
+            if [ -w "${d}" ]; then
+                ACL_OK="${d}"
+            else
+                log_msg "WARN: 应用运行用户对已授权目录 ${d} 无写权限；可运行 bash ${TRIM_APPDEST}/../cmd/acl_apply --full 补齐"
+            fi
+        done < "${f}"
+    done
+    if [ -n "${ACL_OK}" ]; then
+        log_msg "permission OK (rw): ${ACL_OK}"
+    else
+        log_msg "HINT: 尚未检测到可写的授权目录，请先在 系统设置 › 应用 › 视频助手 › 访问权限 中添加"
+    fi
+
+    HOST="${VT_BIND_HOST:-0.0.0.0}"
+    PORT_NUM="${VT_BIND_PORT:-18080}"
+    log_msg "bind=${HOST}:${PORT_NUM}"
+    PORT_ERR="$(port_free "${HOST}" "${PORT_NUM}")"
+    if [ $? -ne 0 ]; then
+        log_msg "ERROR: 无法绑定 ${HOST}:${PORT_NUM}：${PORT_ERR}"
+        log_msg "HINT: 端口可能被其他进程占用，运行 ss -ltnp | grep ':${PORT_NUM}' 查看；"
+        log_msg "HINT: 也可以设置环境变量 VT_BIND_PORT 改用其他端口后重启应用。"
+        return 1
+    fi
+    log_msg "port ${HOST}:${PORT_NUM} is free"
+
+    cd "${SERVER_DIR}" || { log_msg "ERROR: cd 失败：${SERVER_DIR}"; return 1; }
+    PORT="${PORT_NUM}" \
+        "${PYBIN}" "${ENTRY}" --host "${HOST}" --port "${PORT_NUM}" >> "${LOG_FILE}" 2>&1 &
     local p=$!
     printf "%s" "$p" > "${PID_FILE}"
-    log_msg "pid = ${p}"
+    log_msg "pid=${p}"
     sleep 3
-    if check_process "${p}"; then
-        log_msg "started OK"
+    if ! check_process "${p}"; then
+        log_msg "ERROR: 服务启动后立即退出，原因见上方 Python 输出"
+        log_msg "--- last 20 log lines ---"
+        tail -n 20 "${LOG_FILE}" 2>/dev/null | while IFS= read -r line; do log_msg "  ${line}"; done
+        rm -f "${PID_FILE}"
+        return 1
+    fi
+    CHECK_HOST="${HOST}"
+    [ "${HOST}" = "0.0.0.0" ] && CHECK_HOST="127.0.0.1"
+    if port_reachable "${CHECK_HOST}" "${PORT_NUM}"; then
+        log_msg "started OK: ${HOST}:${PORT_NUM} (pid=${p})"
     else
-        log_msg "ERROR: process died immediately, see log above"
+        log_msg "WARN: 进程存活但端口 ${CHECK_HOST}:${PORT_NUM} 暂时不可连接，请查看上方 Python 日志"
     fi
     return 0
 }
@@ -61,7 +204,7 @@ stop_process() {
         local pid
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
         log_msg "pid=${pid}"
-        if ! check_process "${pid}"; then
+        if ! check_process "${pid}" || ! is_app_pid "${pid}"; then
             rm -f "${PID_FILE}"; log_msg "not running"; return 0
         fi
         kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1
