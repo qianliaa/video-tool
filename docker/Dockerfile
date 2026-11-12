@@ -1,16 +1,26 @@
-﻿FROM python:3.11-slim
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg curl ca-certificates \
-    && curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-        -o /usr/local/bin/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Asia/Shanghai \
+    TRIM_PKGVAR=/data \
+    TRIM_DATA_ACCESSIBLE_PATHS=/media \
+    VT_BIND_HOST=0.0.0.0 \
+    VT_BIND_PORT=18080
+
+# 与 fpk 安装包使用同一套程序：ffmpeg 由镜像提供，后端只用 Python 标准库
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+WORKDIR /opt/video-tool
+COPY fpk/app/ /opt/video-tool/
+RUN mkdir -p /data /media
 
-EXPOSE 8090
-CMD ["python", "app.py"]
+VOLUME ["/media", "/data"]
+EXPOSE 18080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/api/config', timeout=3)"
+
+CMD ["python", "/opt/video-tool/server/app.py", "--host", "0.0.0.0", "--port", "18080"]

@@ -1,0 +1,17 @@
+services:
+  video-tool:
+    image: ghcr.io/qianliaa/video-tool:1.7.5
+    container_name: video-tool
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    environment:
+      TZ: Asia/Shanghai
+      # 同时执行的转码 / 下载任务数（1-8）
+      VT_MAX_TASKS: "2"
+      VT_MAX_DOWNLOADS: "3"
+    volumes:
+      # 容器内只有 /media 是媒体授权目录，输入与输出都必须位于该目录下
+      - ./media:/media
+      # 配置与任务列表
+      - ./data:/data

@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/video-tool
+
+jobs:
+  fpk:
+    name: Build fpk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Build fpk
+        run: python pack.py
+
+      - name: Upload fpk
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpk
+          path: video-tool-${{ steps.ver.outputs.version }}.fpk
+          if-no-files-found: error
+
+  docker:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fpk, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fpk
+
+      - name: Prepare release files
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cp docker/docker-compose.yml docker-compose.yml
+          FPK="video-tool-${VERSION}.fpk"
+          SHA=$(sha256sum "$FPK" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          CHANGELOG=$(sed -n 's/^changelog[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')
+          {
+            echo "## 视频助手 ${VERSION}"
+            echo
+            echo "${CHANGELOG}"
+            echo
+            echo "### 方式一：飞牛 fnOS（fpk）"
+            echo
+            echo "- 下载 \`video-tool-${VERSION}.fpk\`，在飞牛应用中心手动安装"
+            echo "- 安装后在「系统设置 › 应用 › 视频助手 › 访问权限」授权目录"
+            echo "- SHA-256：\`${SHA}\`"
+            echo
+            echo "### 方式二：Docker"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE_NAME}:${VERSION}"
+            echo "docker compose up -d"
+            echo '```'
+            echo
+            echo "- 下载下方 \`docker-compose.yml\`，与 \`media/\`、\`data/\` 目录放在同一级"
+            echo "- 打开 \`http://<NAS>:18080/\` 使用"
+            echo "- 镜像支持 linux/amd64 与 linux/arm64"
+          } > release-body.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            video-tool-${{ steps.ver.outputs.version }}.fpk
+            docker-compose.yml
+          body_path: release-body.md

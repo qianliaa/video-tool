@@ -1,8 +1,36 @@
 # video-tool
 
-基于 ffmpeg 的视频处理工具箱，提供 Web 界面，可打包为飞牛 OS（fnOS）应用。
+[![Release](https://img.shields.io/github/v/release/qianliaa/video-tool)](https://github.com/qianliaa/video-tool/releases)
+[![Docker](https://img.shields.io/badge/ghcr.io-video--tool-blue)](https://github.com/qianliaa/video-tool/pkgs/container/video-tool)
 
-当前版本：**1.7.4**。打开 `http://<NAS>:18080/` 即可使用，**无需登录、无账号体系**。
+基于 ffmpeg 的视频处理工具箱，提供 Web 界面，可打包为飞牛 OS（fnOS）应用，也提供 Docker 镜像。
+
+当前版本：**1.7.5**。打开 `http://<NAS>:18080/` 即可使用，**无需登录、无账号体系**。
+
+## 部署
+
+两种方式使用同一套程序，功能完全一致。
+
+### 飞牛 fnOS（fpk）
+
+从 [Releases](https://github.com/qianliaa/video-tool/releases) 下载 `video-tool-<版本>.fpk`，在飞牛应用中心手动安装；安装后在「系统设置 › 应用 › 视频助手 › 访问权限」授权目录。
+
+### Docker
+
+```bash
+docker pull ghcr.io/qianliaa/video-tool:1.7.5
+```
+
+下载 Release 中的 `docker-compose.yml`，与 `media/`、`data/` 目录放在同一级，然后：
+
+```bash
+docker compose up -d
+```
+
+- `./media` → 容器 `/media`：媒体授权目录，输入与输出都必须位于该目录下
+- `./data` → 容器 `/data`：配置与任务列表
+- 端口 `18080`，并发数可用 `VT_MAX_TASKS` / `VT_MAX_DOWNLOADS` 调整
+- 镜像支持 `linux/amd64` 与 `linux/arm64`，镜像内已包含 ffmpeg
 
 ## 功能
 
@@ -32,7 +60,7 @@
 
 ## 目录设置
 
-- 先在 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」中授权目标文件夹
+- 先在 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」中授权目标文件夹；Docker 部署时对应挂载到容器 `/media`
 - 应用内的输入 / 输出目录**只能从已授权目录里浏览选择**，不接受手填路径；授权变更后无需重启
 - 输入目录递归读取子文件夹，输出文件名支持子目录（如 `out/result.mp4`）
 - 输入与输出**可以是同一目录**
@@ -58,6 +86,7 @@ python pack.py
 - Python 3.8+（优先使用飞牛应用中心的 Python 3.11/3.12/3.10/3.9）
 - ffmpeg（含 ffprobe）：按 PATH、`/usr/bin`、`/usr/local/bin`、飞牛应用目录依次查找
 - 后端只用 Python 标准库，不依赖 Flask / pip / venv，也不需要 yt-dlp
+- Docker 镜像已内置 Python 3.11 与 ffmpeg，无需在宿主机安装
 
 ## 目录
 
@@ -65,13 +94,17 @@ python pack.py
 fpk/
 ├── manifest                # 应用信息与版本
 ├── ICON.PNG / ICON_256.PNG # 图标
-├── app/                    # 安装后 = target（打进 app.tgz）
+├── app/                    # 安装后 = target（打进 app.tgz），Docker 镜像同样使用此目录
 │   ├── server/app.py       # 标准库 HTTP 后端
 │   └── ui/                 # 前端页面、PWA manifest、桌面入口与图标
 ├── cmd/                    # 生命周期脚本（含 acl_apply）
 └── config/                 # privilege / resource
+
+docker/
+├── Dockerfile              # 基于 fpk/app 构建，内置 ffmpeg
+└── docker-compose.yml      # Release 随包附带
 ```
 
 ## CI
 
-推送到 `main` 或打 `v*` 标签时，GitHub Actions 自动执行 `python pack.py` 并上传 fpk 产物；**打标签时会自动创建 Release 并附上 fpk**。
+推送到 `main` 或打 `v*` 标签时，GitHub Actions 同时构建 fpk 与 Docker 镜像（GHCR，amd64 / arm64）；打标签时会创建 Release，附上 `video-tool-<版本>.fpk` 与 `docker-compose.yml`。

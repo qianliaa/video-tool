@@ -15,3 +15,7 @@ _smoke/
 fnpack.exe
 template-demo/
 icon-src.jpg
+
+# Docker 本地运行目录
+data/
+media/

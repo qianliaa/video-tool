@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+.idea
+*.fpk
+*.md
+data
+media
+__pycache__
+*.pyc
