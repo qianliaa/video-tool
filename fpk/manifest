@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.7.3
+version               = 1.7.4
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 1.7.3：移除侧边栏底部与「设置」导航重复的「目录与设置」按钮及其事件与样式；移动端「更多」面板里的设置项文案统一为「设置」。其余与 1.7.2 一致。
+changelog             = 1.7.4：任务列表显示任务名称（取自输出文件名），并在名称旁保留任务类型标签；完成/失败提示与日志标题同步显示任务名称。其余与 1.7.3 一致。
 platform              = x86
 source                = thirdparty
 maintainer            = 千里

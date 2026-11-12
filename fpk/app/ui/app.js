@@ -750,6 +750,11 @@
     return ACTION_LABEL[t.action] || t.action;
   }
 
+  // 任务名称优先用后端给出的输出文件名，缺失时退回动作名称
+  function taskName(t) {
+    return t.name || taskLabel(t);
+  }
+
   function updateTaskBadge() {
     var n = state.tasks.filter(function (t) {
       return t.status === "running" || t.status === "queued";
@@ -771,7 +776,8 @@
       var pct = unknown ? 0 : Math.max(0, Math.min(100, Number(t.progress) || 0));
       item.innerHTML =
         '<div class="task-top">' +
-          '<span class="task-name">' + esc(taskLabel(t)) + '</span>' +
+          '<span class="task-name">' + esc(taskName(t)) + '</span>' +
+          (t.name ? '<span class="task-kind">' + esc(taskLabel(t)) + '</span>' : '') +
           '<span class="status ' + esc(t.status) + '">' + esc(STATUS_LABEL[t.status] || t.status) + '</span>' +
           (t.status === "running" ? '<span class="task-time">' + esc(unknown ? taskStat(t) : pct.toFixed(0) + "%") + '</span>' : '') +
           '<span class="task-time">' + esc(fmtDate(t.created)) + '</span>' +
@@ -796,12 +802,12 @@
         if ((before === "running" || before === "queued") &&
             (t.status === "done" || t.status === "failed" || t.status === "canceled")) {
           if (t.status === "done") {
-            toast(taskLabel(t) + " 已完成", "success");
+            toast(taskName(t) + " 已完成", "success");
             if (state.logId !== t.id) loadFiles();
           } else if (t.status === "failed") {
-            toast(taskLabel(t) + " 失败，请查看日志", "error", 6000);
+            toast(taskName(t) + " 失败，请查看日志", "error", 6000);
           } else if (t.status === "canceled") {
-            toast(taskLabel(t) + " 已取消");
+            toast(taskName(t) + " 已取消");
           }
         }
       });
@@ -847,6 +853,12 @@
     $("#logBody").textContent = "正在读取日志…";
     $("#logProgress").style.width = "0%";
     $("#logSub").textContent = "任务 " + id.slice(0, 8);
+    for (var i = 0; i < state.tasks.length; i++) {
+      if (state.tasks[i].id === id) {
+        $("#logTitle").textContent = taskName(state.tasks[i]);
+        break;
+      }
+    }
     pollLog();
     clearInterval(state.logTimer);
     state.logTimer = setInterval(pollLog, 1000);
@@ -891,7 +903,7 @@
       for (var i = 0; i < state.tasks.length; i++) {
         if (state.tasks[i].id === id) { task = state.tasks[i]; break; }
       }
-      $("#logTitle").textContent = task ? taskLabel(task) : "任务日志";
+      $("#logTitle").textContent = task ? taskName(task) : "任务日志";
       $("#logSub").textContent = (STATUS_LABEL[data.status] || data.status) +
         " · " + (unknown ? taskStat(data) : pct.toFixed(0) + "%") + " · " + id.slice(0, 8);
       var cancelBtn = $("#logCancel");

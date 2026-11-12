@@ -34,7 +34,7 @@ APP_DIR = os.path.dirname(BASE_DIR)
 UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -840,6 +840,8 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "owner": owner or "",
         "owner_name": owner_name or "",
         "output": output or "",
+        # 任务名称取输出文件名，供任务列表直接展示
+        "name": os.path.basename(output) if output else "",
     }
     with TASKS_LOCK:
         TASKS[task_id] = task
@@ -2092,6 +2094,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": task["id"],
                     "tool": task["tool"],
                     "action": task["action"],
+                    "name": task.get("name") or "",
                     "status": task["status"],
                     "progress": task["progress"],
                     "written": task.get("written", 0),
