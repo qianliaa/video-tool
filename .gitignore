@@ -19,3 +19,13 @@ icon-src.jpg
 # Docker 本地运行目录
 data/
 media/
+
+# 独立桌面版本地构建产物（CI 会重新构建，无需提交）
+dist/
+build/
+pkg-win/
+pkg-linux/
+ffmpeg.zip
+ffmpeg_extract/
+*.zip
+*.tar.gz

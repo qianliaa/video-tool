@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.7.5">
+<link rel="stylesheet" href="style.css?v=1.8.0">
 </head>
 <body>
 <div class="app">
@@ -540,10 +540,10 @@
               <button class="btn ghost" data-pick="output">浏览</button>
             </div>
           </div>
-          <p class="hint">点击「浏览」从已授权目录中选择。输入与输出<b>可以是同一目录</b>；同名输出文件会自动重命名，不会覆盖原文件。选择时自动检查读写权限。</p>
+          <p class="hint">点击「浏览」从本机目录中选择。输入与输出<b>可以是同一目录</b>；同名输出文件会自动重命名，不会覆盖原文件。选择时自动检查读写权限。</p>
           <div class="notice">
             <strong>在应用里看不到文件夹？</strong>
-            <p>先到 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」添加并授权文件夹，然后回到应用点击「浏览」重新打开即可。授权变更后无需重启应用。</p>
+            <p>在下方点击「浏览」逐层选择本机文件夹即可；选择后界面会自动检查该目录的读写权限。独立版（Windows / Linux 桌面）可直接选任意文件夹，无需额外授权。</p>
           </div>
         </div>
 
@@ -637,7 +637,7 @@
       <h2 id="pickerTitle">选择目录</h2>
       <button class="icon-btn" id="pickerClose" title="关闭">×</button>
     </div>
-    <p class="picker-hint">先在 fnOS「系统设置 › 应用 › 视频助手 › 访问权限」中授权文件夹，再从下方列表逐层选择。</p>
+    <p class="picker-hint">从下方列表逐层选择本机文件夹即可；当前所在目录会显示在上方，点击「上一级」返回。</p>
     <div class="picker-path">
       <button class="icon-btn" id="pickerUp" title="上一级">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
@@ -674,6 +674,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.7.5"></script>
+<script src="app.js?v=1.8.0"></script>
 </body>
 </html>

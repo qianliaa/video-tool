@@ -1,6 +1,6 @@
 services:
   video-tool:
-    image: ghcr.io/qianliaa/video-tool:1.7.5
+    image: ghcr.io/qianliaa/video-tool:1.8.0
     container_name: video-tool
     restart: unless-stopped
     ports:

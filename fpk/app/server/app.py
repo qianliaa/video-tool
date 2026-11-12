@@ -29,12 +29,23 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_DIR = os.path.dirname(BASE_DIR)
-UI_DIR = os.path.join(APP_DIR, "ui")
+if getattr(sys, "frozen", False):
+    # PyInstaller onefile：资源解压到 _MEIPASS，ui 与 app.py 同级；bin 与 exe 同级。
+    _MEIPASS = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    BASE_DIR = _MEIPASS
+    APP_DIR = _MEIPASS
+    UI_DIR = os.path.join(_MEIPASS, "ui")
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    APP_DIR = os.path.dirname(BASE_DIR)
+    UI_DIR = os.path.join(APP_DIR, "ui")
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_VERSION = "1.7.5"
+# 独立模式（Win/Linux 桌面）：绕过 fnOS 授权，允许用户直接选择本机任意目录。
+# 由环境变量 VT_STANDALONE=1 或命令行 --standalone 开启；fpk / Docker 默认关闭。
+STANDALONE = os.environ.get("VT_STANDALONE", "").lower() in ("1", "true", "yes", "on")
+
+APP_VERSION = "1.8.0"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -161,19 +172,36 @@ def find_ffprobe_near(ffmpeg):
 
 
 def resolve_binaries():
-    """固定使用系统原生 ffmpeg，解析结果放在模块全局变量中。"""
+    """固定使用系统原生 ffmpeg，解析结果放在模块全局变量中。
+
+    独立模式优先使用随包附带的 bin/ffmpeg（与可执行文件同级），
+    找不到再回退到系统 PATH（用户自行安装的 ffmpeg）。
+    """
     global FFMPEG_BIN, FFPROBE_BIN, FFMPEG_ERROR
     FFMPEG_BIN = None
     FFPROBE_BIN = None
     FFMPEG_ERROR = ""
-    FFMPEG_BIN = find_system_bin("ffmpeg", exclude_dir=BIN_DIR)
+    if STANDALONE and getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        bin_dir = os.path.join(exe_dir, "bin")
+        names = ("ffmpeg.exe", "ffmpeg") if os.name == "nt" else ("ffmpeg", "ffmpeg.exe")
+        for n in names:
+            cand = os.path.join(bin_dir, n)
+            if _executable(cand):
+                FFMPEG_BIN = os.path.abspath(cand)
+                break
     if not FFMPEG_BIN:
-        FFMPEG_ERROR = "未找到系统 ffmpeg，请先在飞牛系统或应用中心安装 ffmpeg 后重试。"
+        FFMPEG_BIN = find_system_bin("ffmpeg", exclude_dir=(BIN_DIR if not STANDALONE else None))
+    if not FFMPEG_BIN:
+        if STANDALONE:
+            FFMPEG_ERROR = "未找到 ffmpeg：请确认 bin 目录包含 ffmpeg 与 ffprobe，或系统 PATH 已安装 ffmpeg。"
+        else:
+            FFMPEG_ERROR = "未找到系统 ffmpeg，请先在飞牛系统或应用中心安装 ffmpeg 后重试。"
     if FFMPEG_BIN:
         FFMPEG_BIN = os.path.abspath(FFMPEG_BIN)
         FFPROBE_BIN = find_ffprobe_near(FFMPEG_BIN)
         if not FFPROBE_BIN:
-            FFPROBE_BIN = find_system_bin("ffprobe", exclude_dir=BIN_DIR)
+            FFPROBE_BIN = find_system_bin("ffprobe", exclude_dir=(BIN_DIR if not STANDALONE else None))
         if FFPROBE_BIN:
             FFPROBE_BIN = os.path.abspath(FFPROBE_BIN)
     return FFMPEG_BIN
@@ -242,7 +270,12 @@ OUT_OF_SCOPE_HINT = ("请先在 系统设置 › 应用 › 视频助手 › 访
 
 
 def within_user_root(state, path):
-    """所有路径必须落在 fnOS 授权目录内；realpath 后判断，拦截 .. 与符号链接。"""
+    """所有路径必须落在授权目录内；realpath 后判断，拦截 .. 与符号链接。
+
+    独立模式下不限制目录范围（用户直接选择本机任意文件夹）。
+    """
+    if STANDALONE:
+        return True
     return within_paths((state or {}).get("roots") or [], path)
 
 
@@ -405,8 +438,28 @@ def _authorized_paths():
     return result
 
 
+def _fs_roots():
+    """独立模式下可浏览的根：Linux 为 /，Windows 为所有存在的盘符。"""
+    if os.name == "nt":
+        import string
+        roots = []
+        for d in string.ascii_uppercase:
+            p = "%s:\\" % d
+            if os.path.isdir(p):
+                roots.append(p)
+        return roots or ["C:\\"]
+    return ["/"]
+
+
 def refresh_roots():
     """每次请求重读授权目录，授权变更后无需重启服务。"""
+    if STANDALONE:
+        roots = _fs_roots()
+        with CONFIG_LOCK:
+            APP_STATE["roots"] = roots
+            APP_STATE["base_roots"] = list(roots)
+            APP_STATE["bootstrap_scope"] = False
+        return roots
     roots = []
     for p in _authorized_paths():
         if not p:
@@ -429,7 +482,7 @@ def _valid_saved_dir(value, write):
     ok, _err = dir_state(path, write, None, enforce_scope=False)
     if not ok or is_app_dir(path):
         return ""
-    if not within_paths(APP_STATE["roots"], path):
+    if not STANDALONE and not within_paths(APP_STATE["roots"], path):
         return ""
     return path
 
@@ -1865,6 +1918,7 @@ class Handler(BaseHTTPRequestHandler):
             "output_error": output_error,
             "configured": input_ok and output_ok,
             "roots": list(state["roots"]),
+            "standalone": STANDALONE,
             "pkgvar": PKGVAR,
             "ffmpeg": FFMPEG_BIN,
             "ffprobe": FFPROBE_BIN,
@@ -2307,7 +2361,16 @@ def main():
     parser.add_argument("--host", default=os.environ.get("VT_BIND_HOST") or "0.0.0.0")
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("VT_BIND_PORT") or "18080"))
+    parser.add_argument("--standalone", action="store_true",
+                        help="独立模式：绕过 fnOS 授权，允许选择本机任意目录（Win/Linux 桌面）")
+    parser.add_argument("--open", action="store_true",
+                        help="启动后自动打开默认浏览器")
     args = parser.parse_args()
+
+    global STANDALONE
+    if args.standalone:
+        STANDALONE = True
+    os.environ.setdefault("VT_STANDALONE", "1" if STANDALONE else "0")
 
     _startup_log("VideoTool %s 启动中（Python %s）" % (
         APP_VERSION, ".".join(str(n) for n in sys.version_info[:3])))
@@ -2339,9 +2402,12 @@ def main():
         _startup_log("WARN: 系统未找到 ffprobe，媒体时长/编码识别会失败；"
                      "请安装完整的 ffmpeg（包含 ffprobe）。")
 
-    _startup_log("访问方式：无需登录；目录范围以 fnOS 应用授权目录为准")
+    _startup_log("访问方式：无需登录；目录范围以 fnOS 应用授权目录为准" if not STANDALONE
+                 else "访问方式：独立模式，可直接在界面选择本机任意文件夹（无需 fnOS 授权）")
     roots = refresh_roots()
-    if roots:
+    if STANDALONE:
+        _startup_log("可浏览根目录：%s" % "、".join(roots))
+    elif roots:
         _startup_log("已授权目录：%s" % "、".join(roots))
     else:
         _startup_log("WARN: 尚未授权任何目录，请先在 系统设置 › 应用 › 视频助手 › 访问权限 中添加")
@@ -2371,6 +2437,20 @@ def main():
     _startup_log("已监听 %s:%d" % (args.host, args.port))
     if args.host not in ("127.0.0.1", "::1", "localhost", ""):
         _startup_log("NOTE: 当前监听非回环地址，局域网内可直接访问且无需登录。")
+
+    if args.open:
+        import webbrowser
+        open_host = "127.0.0.1" if args.host in ("0.0.0.0", "") else args.host
+        open_url = "http://%s:%d/" % (open_host, args.port)
+
+        def _open_browser():
+            time.sleep(1.5)
+            try:
+                webbrowser.open(open_url)
+            except Exception:
+                pass
+
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     try:
         httpd.serve_forever()

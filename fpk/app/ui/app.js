@@ -327,11 +327,11 @@
         if (!input) {
           hint.textContent = "还差输入目录：用于读取要处理的视频。";
         } else if (!inputReady) {
-          hint.textContent = "输入目录不可用：" + (state.config.input_error || "请检查文件夹授权");
+          hint.textContent = "输入目录不可用：" + (state.config.input_error || "请检查文件夹权限");
         } else if (!output) {
           hint.textContent = "还差输出目录：用于保存处理结果。";
         } else if (!outputReady) {
-          hint.textContent = "输出目录不可用：" + (state.config.output_error || "请检查文件夹授权");
+          hint.textContent = "输出目录不可用：" + (state.config.output_error || "请检查文件夹权限");
         } else {
           hint.textContent = "输入目录用于读取视频，输出目录用于保存结果。";
         }
@@ -923,7 +923,7 @@
 
   // ---------------------------------------------------------------- 目录选择
 
-  // 目录只来自 fnOS 授权目录：先展示授权根列表，再逐层浏览，不接受手填路径。
+  // 目录只通过「浏览」逐层选择（fnOS 来自授权目录，独立版来自本机任意目录），输入框保持只读。
 
   function openPicker(mode) {
     state.picker.mode = mode;
@@ -940,8 +940,8 @@
       state.picker.path = data.path || "";
       state.picker.parent = data.parent;
       state.roots = data.roots || state.roots;
-      $("#pickerPath").textContent = data.path || "已授权目录";
-      $("#pickerPath").title = data.path || "已授权目录";
+      $("#pickerPath").textContent = data.path || "根目录";
+      $("#pickerPath").title = data.path || "根目录";
       $("#pickerUp").disabled = data.parent === null || data.parent === undefined;
       $("#pickerChoose").disabled = !data.path;
       $("#pickerNewName").disabled = !data.path;
@@ -988,7 +988,7 @@
 
   function choosePickerDir() {
     var path = state.picker.path;
-    if (!path) { toast("请先从已授权目录中选择一个文件夹", "error"); return; }
+    if (!path) { toast("请先选择一个文件夹", "error"); return; }
     var payload = {
       input_dir: state.config.input_dir,
       output_dir: state.config.output_dir
@@ -1307,7 +1307,7 @@
   }
 
   function bindSettings() {
-    // 目录只能通过「浏览」从授权目录中选择，输入框保持只读。
+    // 目录只能通过「浏览」选择（fnOS 授权目录 / 独立版本机目录），输入框保持只读。
     ["#setInput", "#setOutput"].forEach(function (sel) {
       var el = $(sel);
       if (el) el.readOnly = true;

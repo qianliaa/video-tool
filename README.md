@@ -4,17 +4,26 @@
 [![Docker](https://img.shields.io/badge/ghcr.io-video--tool-blue)](https://github.com/qianliaa/video-tool/pkgs/container/video-tool)
 [![License](https://img.shields.io/github/license/qianliaa/video-tool)](LICENSE)
 
-基于 ffmpeg 的视频处理工具箱，提供 Web 界面，可打包为飞牛 OS（fnOS）应用，也提供 Docker 镜像。
+基于 ffmpeg 的视频处理工具箱，提供 Web 界面，可打包为飞牛 OS（fnOS）应用，也提供 Docker 镜像与 Windows / Linux 独立桌面版。
 
 打开 `http://<NAS>:18080/` 即可使用，**无需登录、无账号体系**。当前版本见 [Releases](https://github.com/qianliaa/video-tool/releases)。
 
 ## 部署
 
-两种方式使用同一套程序，功能完全一致。
+三种方式使用同一套程序，功能完全一致。
 
 ### 飞牛 fnOS（fpk）
 
 从 [Releases](https://github.com/qianliaa/video-tool/releases) 下载 `video-tool-<版本>.fpk`，在飞牛应用中心手动安装；安装后在「系统设置 › 应用 › 视频助手 › 访问权限」授权目录。
+
+### Windows / Linux 独立桌面版（免安装绿色包）
+
+从 [Releases](https://github.com/qianliaa/video-tool/releases) 下载对应平台的压缩包：
+
+- `video-tool-<版本>-windows-x64.zip`：解压后双击 `start.bat` 即可（已内置 ffmpeg，无需安装 Python）
+- `video-tool-<版本>-linux-x64.tar.gz`：解压后运行 `./start.sh` 即可（已内置 ffmpeg）
+
+启动后自动打开浏览器访问 `http://127.0.0.1:18080/`，在界面里直接选择本机任意文件夹作为输入 / 输出目录，**无需任何授权配置**。服务只监听本机回环地址，不暴露到局域网。
 
 ### Docker
 
@@ -98,8 +107,8 @@ python pack.py
 ```
 fpk/
 ├── manifest                # 应用信息与版本
-├── app/                    # 安装后 = target（打进 app.tgz），Docker 镜像同样使用此目录
-│   ├── server/app.py       # 标准库 HTTP 后端
+├── app/                    # 安装后 = target（打进 app.tgz），Docker / 独立桌面版同样使用此目录
+│   ├── server/app.py       # 标准库 HTTP 后端（含独立模式 VT_STANDALONE）
 │   └── ui/                 # 前端页面、PWA manifest、桌面入口与图标
 ├── cmd/                    # 生命周期脚本（含 acl_apply）
 └── config/                 # privilege / resource
@@ -111,11 +120,17 @@ docker/
 
 docs/
 └── faq.md                  # 常见问题
+
+standalone/
+├── build.py                # PyInstaller 单文件构建（跨平台，自动打包 ui）
+├── start.bat               # Windows 启动脚本（设置 VT_STANDALONE=1 并打开浏览器）
+├── start.sh                # Linux 启动脚本
+└── README.txt              # 随包附带的说明
 ```
 
 ## CI
 
-推送到 `main` 或打 `v*` 标签时，GitHub Actions 同时构建 fpk 与 Docker 镜像（GHCR，amd64 / arm64）；打标签时会创建 Release，附上 `video-tool-<版本>.fpk` 与 `docker-compose.yml`。
+推送到 `main` 或打 `v*` 标签时，GitHub Actions 同时构建 fpk、Docker 镜像（GHCR，amd64 / arm64）与 Windows / Linux 独立桌面版；打标签时会创建 Release，附上 `video-tool-<版本>.fpk`、`docker-compose.yml`、`video-tool-<版本>-windows-x64.zip` 与 `video-tool-<版本>-linux-x64.tar.gz`。
 
 ## 许可证
 

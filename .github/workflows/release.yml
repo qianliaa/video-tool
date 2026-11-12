@@ -72,10 +72,101 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  standalone-win:
+    name: Build Windows standalone
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build executable
+        run: python standalone/build.py
+
+      - name: Download ffmpeg (essentials)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract
+          $ff = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $pr = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if (-not $ff -or -not $pr) { throw "ffmpeg 静态构建里未找到 ffmpeg.exe / ffprobe.exe" }
+          New-Item -ItemType Directory -Force -Path pkg-win\bin | Out-Null
+          Copy-Item $ff.FullName -Destination pkg-win\bin\ffmpeg.exe
+          Copy-Item $pr.FullName -Destination pkg-win\bin\ffprobe.exe
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Copy-Item dist\video-tool.exe -Destination pkg-win\
+          Copy-Item standalone\start.bat -Destination pkg-win\
+          Copy-Item standalone\README.txt -Destination pkg-win\
+          $zip = "video-tool-${{ steps.ver.outputs.version }}-windows-x64.zip"
+          Compress-Archive -Path pkg-win\* -DestinationPath $zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-win
+          path: video-tool-${{ steps.ver.outputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+  standalone-linux:
+    name: Build Linux standalone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Install PyInstaller and ffmpeg
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Build executable
+        run: python standalone/build.py
+
+      - name: Assemble package
+        run: |
+          mkdir -p pkg-linux/bin
+          cp dist/video-tool pkg-linux/
+          cp standalone/start.sh pkg-linux/
+          cp standalone/README.txt pkg-linux/
+          cp /usr/bin/ffmpeg pkg-linux/bin/
+          cp /usr/bin/ffprobe pkg-linux/bin/
+          tar czf "video-tool-${{ steps.ver.outputs.version }}-linux-x64.tar.gz" -C pkg-linux .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-linux
+          path: video-tool-${{ steps.ver.outputs.version }}-linux-x64.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fpk, docker]
+    needs: [fpk, docker, standalone-win, standalone-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,13 +179,25 @@ jobs:
         with:
           name: fpk
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone-win
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone-linux
+
       - name: Prepare release files
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           cp docker/docker-compose.yml docker-compose.yml
           FPK="video-tool-${VERSION}.fpk"
-          SHA=$(sha256sum "$FPK" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          WIN="video-tool-${VERSION}-windows-x64.zip"
+          LINUX="video-tool-${VERSION}-linux-x64.tar.gz"
+          FPK_SHA=$(sha256sum "$FPK" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          WIN_SHA=$(sha256sum "$WIN" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          LINUX_SHA=$(sha256sum "$LINUX" | cut -d' ' -f1 | tr 'a-f' 'A-F')
           CHANGELOG=$(sed -n 's/^changelog[[:space:]]*=[[:space:]]*//p' fpk/manifest | tr -d '\r')
           {
             echo "## 视频助手 ${VERSION}"
@@ -105,9 +208,17 @@ jobs:
             echo
             echo "- 下载 \`video-tool-${VERSION}.fpk\`，在飞牛应用中心手动安装"
             echo "- 安装后在「系统设置 › 应用 › 视频助手 › 访问权限」授权目录"
-            echo "- SHA-256：\`${SHA}\`"
+            echo "- SHA-256：\`${FPK_SHA}\`"
             echo
-            echo "### 方式二：Docker"
+            echo "### 方式二：Windows / Linux 独立桌面版（免安装绿色包）"
+            echo
+            echo "- Windows：下载 \`${WIN}\`，解压后双击 \`start.bat\`（已内置 ffmpeg，无需安装 Python）"
+            echo "- Linux：下载 \`${LINUX}\`，解压后运行 \`./start.sh\`（已内置 ffmpeg）"
+            echo "- 启动后自动打开浏览器 \`http://127.0.0.1:18080/\`，在界面里直接选择本机任意文件夹作为输入 / 输出，无需任何授权配置"
+            echo "- Windows SHA-256：\`${WIN_SHA}\`"
+            echo "- Linux SHA-256：\`${LINUX_SHA}\`"
+            echo
+            echo "### 方式三：Docker"
             echo
             echo '```bash'
             echo "docker pull ${IMAGE_NAME}:${VERSION}"
@@ -124,5 +235,7 @@ jobs:
         with:
           files: |
             video-tool-${{ steps.ver.outputs.version }}.fpk
+            video-tool-${{ steps.ver.outputs.version }}-windows-x64.zip
+            video-tool-${{ steps.ver.outputs.version }}-linux-x64.tar.gz
             docker-compose.yml
           body_path: release-body.md
