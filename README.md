@@ -2,10 +2,11 @@
 
 [![Release](https://img.shields.io/github/v/release/qianliaa/video-tool)](https://github.com/qianliaa/video-tool/releases)
 [![Docker](https://img.shields.io/badge/ghcr.io-video--tool-blue)](https://github.com/qianliaa/video-tool/pkgs/container/video-tool)
+[![License](https://img.shields.io/github/license/qianliaa/video-tool)](LICENSE)
 
 基于 ffmpeg 的视频处理工具箱，提供 Web 界面，可打包为飞牛 OS（fnOS）应用，也提供 Docker 镜像。
 
-当前版本：**1.7.5**。打开 `http://<NAS>:18080/` 即可使用，**无需登录、无账号体系**。
+打开 `http://<NAS>:18080/` 即可使用，**无需登录、无账号体系**。当前版本见 [Releases](https://github.com/qianliaa/video-tool/releases)。
 
 ## 部署
 
@@ -18,10 +19,10 @@
 ### Docker
 
 ```bash
-docker pull ghcr.io/qianliaa/video-tool:1.7.5
+docker pull ghcr.io/qianliaa/video-tool:latest
 ```
 
-下载 Release 中的 `docker-compose.yml`，与 `media/`、`data/` 目录放在同一级，然后：
+下载 Release 中的 `docker-compose.yml`（v1.7.5 起随 Release 提供），与 `media/`、`data/` 目录放在同一级，然后：
 
 ```bash
 docker compose up -d
@@ -73,6 +74,10 @@ docker compose up -d
 
 设置页「关于与更新」查询本仓库的 GitHub Releases，比较版本并给出 `.fpk` 下载链接。未登录 GitHub API 每小时限 60 次，可通过环境变量 `VT_GITHUB_TOKEN` 提升限额。
 
+## 常见问题
+
+ffmpeg 找不到、授权目录不可选、直链下载失败、端口被占用等，见 [docs/faq.md](docs/faq.md)。
+
 ## 打包
 
 ```bash
@@ -93,18 +98,25 @@ python pack.py
 ```
 fpk/
 ├── manifest                # 应用信息与版本
-├── ICON.PNG / ICON_256.PNG # 图标
 ├── app/                    # 安装后 = target（打进 app.tgz），Docker 镜像同样使用此目录
 │   ├── server/app.py       # 标准库 HTTP 后端
 │   └── ui/                 # 前端页面、PWA manifest、桌面入口与图标
 ├── cmd/                    # 生命周期脚本（含 acl_apply）
 └── config/                 # privilege / resource
+# 外层 ICON.PNG / ICON_256.PNG 由 build_fpk.py 打包时从 ui/images 取，不在仓库里重复存放
 
 docker/
 ├── Dockerfile              # 基于 fpk/app 构建，内置 ffmpeg
 └── docker-compose.yml      # Release 随包附带
+
+docs/
+└── faq.md                  # 常见问题
 ```
 
 ## CI
 
 推送到 `main` 或打 `v*` 标签时，GitHub Actions 同时构建 fpk 与 Docker 镜像（GHCR，amd64 / arm64）；打标签时会创建 Release，附上 `video-tool-<版本>.fpk` 与 `docker-compose.yml`。
+
+## 许可证
+
+[MIT](LICENSE)。

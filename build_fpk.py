@@ -7,6 +7,7 @@
   3. gzip 头带 FNAME 且 OS 字段为 0xff，与历史可安装包不一致、也不可复现。
 
 本脚本改为：固定白名单条目 + 手工 TarInfo + 手写 gzip 头 + 构建后逐项自检。
+外层 ICON.PNG / ICON_256.PNG 不在仓库里重复存放，打包时从内层 ui/images 取同尺寸图标。
 用法：
     python build_fpk.py                       # 使用默认源码目录与输出名
     python build_fpk.py --src DIR --out FILE # 自定义
@@ -45,6 +46,11 @@ OUTER_SEQUENCE = [
     ("config/privilege", "file", 0o644),
     ("config/resource", "file", 0o644),
 ]
+# 外层图标不在仓库里重复存一份，打包时从内层 ui/images 取同尺寸图标
+OUTER_FALLBACK = {
+    "ICON.PNG": "ui/images/icon_64.png",
+    "ICON_256.PNG": "ui/images/icon_256.png",
+}
 # 内层 app.tgz 条目顺序（15 项），绝不递归扫描目录
 INNER_SEQUENCE = [
     ("server", "dir", 0o755),
@@ -89,7 +95,7 @@ def read_source(src, rel, normalize_lf=False):
     return data
 
 
-def build_tar(sequence, src, include_app_tgz=None):
+def build_tar(sequence, src, include_app_tgz=None, fallback_src=None):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         for name, kind, mode in sequence:
@@ -106,7 +112,11 @@ def build_tar(sequence, src, include_app_tgz=None):
                 tar.addfile(info)
                 continue
             info.type = tarfile.REGTYPE
-            data = read_source(src, name, normalize_lf=name.startswith("cmd/"))
+            if fallback_src and name in OUTER_FALLBACK and not os.path.isfile(
+                    os.path.join(src, name)):
+                data = read_source(fallback_src, OUTER_FALLBACK[name])
+            else:
+                data = read_source(src, name, normalize_lf=name.startswith("cmd/"))
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
         if include_app_tgz is not None:
@@ -132,6 +142,9 @@ def preflight(src, inner_src=None):
                 if not os.path.isdir(path):
                     problems.append("缺少目录：%s" % name)
             elif not os.path.isfile(path):
+                fb = OUTER_FALLBACK.get(name) if base == src else None
+                if fb and os.path.isfile(os.path.join(inner_src, fb.replace("/", os.sep))):
+                    continue
                 problems.append("缺少文件：%s" % name)
     # 源码目录里是否混进杂质（即使不在白名单里也要提醒）
     for base in (src, inner_src):
@@ -235,7 +248,8 @@ def main():
     print("版本：", version)
 
     app_tgz = gzip_bytes(build_tar(INNER_SEQUENCE, inner_src))
-    outer_raw = build_tar(OUTER_SEQUENCE, src, include_app_tgz=app_tgz)
+    outer_raw = build_tar(OUTER_SEQUENCE, src, include_app_tgz=app_tgz,
+                          fallback_src=inner_src)
     payload = gzip_bytes(outer_raw)
     with open(out, "wb") as fp:
         fp.write(payload)
@@ -252,7 +266,8 @@ def main():
 
     # 可复现性验证：同样源码再构建一次应得到相同字节
     again = gzip_bytes(build_tar(OUTER_SEQUENCE, src,
-                                 include_app_tgz=gzip_bytes(build_tar(INNER_SEQUENCE, inner_src))))
+                                 include_app_tgz=gzip_bytes(build_tar(INNER_SEQUENCE, inner_src)),
+                                 fallback_src=inner_src))
     assert again == payload, "同一源码两次打包结果不一致（不可复现）"
     print("  可复现性     : 通过（两次构建字节完全一致）")
     return 0
