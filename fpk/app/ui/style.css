@@ -803,6 +803,24 @@ details.adv summary:hover { color: var(--text); }
 /* ---------- 任务 ---------- */
 
 .task-list { display: flex; flex-direction: column; gap: 10px; }
+.task-batchbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.task-checkall { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer; }
+.task-selected { font-size: 12px; color: var(--muted); }
+.task-batch-actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.task-check { display: inline-flex; align-items: center; cursor: pointer; }
+.task-check input,
+.task-checkall input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
 .task-item {
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -811,6 +829,7 @@ details.adv summary:hover { color: var(--text); }
   transition: border-color .15s;
 }
 .task-item.running { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.task-item.paused { border-color: color-mix(in srgb, var(--amber) 45%, transparent); }
 .task-top {
   display: flex;
   align-items: center;
@@ -843,6 +862,7 @@ details.adv summary:hover { color: var(--text); }
 .status.done { color: var(--green); background: var(--green-soft); }
 .status.failed { color: var(--red); background: var(--red-soft); }
 .status.canceled { color: var(--amber); background: var(--amber-soft); }
+.status.paused { color: var(--amber); background: var(--amber-soft); }
 .status.running::before {
   content: "";
   width: 6px; height: 6px;
@@ -878,6 +898,7 @@ details.adv summary:hover { color: var(--text); }
 .task-item.done .progress-bar { background: var(--green); }
 .task-item.failed .progress-bar { background: var(--red); }
 .task-item.canceled .progress-bar { background: var(--amber); }
+.task-item.paused .progress-bar { background: var(--amber); }
 
 /* ---------- 设置 ---------- */
 
@@ -1288,6 +1309,7 @@ details.adv summary:hover { color: var(--text); }
   .search { width: 100%; }
   .card-head .head-tools { width: 100%; }
   .head-tools .search { flex: 1; }
+  .task-batch-actions { margin-left: 0; width: 100%; }
   .setup-banner { align-items: stretch; margin-top: -4px; }
   .setup-actions { width: 100%; }
   .setup-actions .btn { flex: 1; }

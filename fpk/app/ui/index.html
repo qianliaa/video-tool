@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="64x64" href="images/icon_64.png">
 <link rel="apple-touch-icon" sizes="180x180" href="images/icon_180.png">
-<link rel="stylesheet" href="style.css?v=1.8.0">
+<link rel="stylesheet" href="style.css?v=1.8.4">
 </head>
 <body>
 <div class="app">
@@ -509,9 +509,20 @@
         <div class="card-head">
           <div>
             <h2>任务列表</h2>
-            <p class="card-sub">提交任务后可继续添加；点击「日志」查看进度，多个任务会并行执行</p>
+            <p class="card-sub">可勾选多个任务批量开始 / 继续、暂停、取消或删除；点「日志」查看单个任务进度</p>
           </div>
           <button class="btn ghost small" id="tasksRefresh">刷新</button>
+        </div>
+        <div class="task-batchbar">
+          <label class="task-checkall"><input type="checkbox" id="taskSelectAll"> 全选</label>
+          <span class="task-selected" id="taskSelectedCount">已选 0 项</span>
+          <div class="task-batch-actions">
+            <button class="btn ghost small" data-batch="start">开始 / 继续</button>
+            <button class="btn ghost small" data-batch="pause">暂停</button>
+            <button class="btn ghost small" data-batch="cancel">取消</button>
+            <button class="btn danger small" data-batch="delete">删除</button>
+            <button class="btn ghost small" id="tasksClearDone">清除已结束</button>
+          </div>
         </div>
         <div id="taskList" class="task-list"></div>
         <div class="empty" id="tasksEmpty" hidden>
@@ -674,6 +685,6 @@
   </div>
 </div>
 
-<script src="app.js?v=1.8.0"></script>
+<script src="app.js?v=1.8.4"></script>
 </body>
 </html>

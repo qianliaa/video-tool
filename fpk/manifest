@@ -1,8 +1,8 @@
 appname               = video-tool
-version               = 1.8.0
+version               = 1.8.4
 display_name          = 视频助手
 desc                  = 基于 ffmpeg 的视频处理工具箱：合并、转换、压缩、剪辑、字幕、截图与直链/HLS/DASH 下载，输入输出目录由用户授权选择，本地处理不上传
-changelog             = 1.8.0：新增 Windows / Linux 独立桌面版（免安装绿色包，内置 ffmpeg，可直接选本机任意目录，无需 fnOS）；fpk 与 Docker 同步支持独立模式（环境变量 VT_STANDALONE）。
+changelog             = 1.8.4：任务列表支持多选批量操作（开始/继续、暂停、取消、删除、清除已结束）；排队与运行中的任务可暂停并恢复，已结束任务可一键重试。fpk 与 Docker 的既有流程不变。
 platform              = x86
 source                = thirdparty
 maintainer            = 千里

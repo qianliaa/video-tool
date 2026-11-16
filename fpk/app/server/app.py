@@ -42,10 +42,18 @@ else:
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
 # 独立模式（Win/Linux 桌面）：绕过 fnOS 授权，允许用户直接选择本机任意目录。
-# 由环境变量 VT_STANDALONE=1 或命令行 --standalone 开启；fpk / Docker 默认关闭。
-STANDALONE = os.environ.get("VT_STANDALONE", "").lower() in ("1", "true", "yes", "on")
+# 开启方式（任一即可）：
+#   - 环境变量 VT_STANDALONE=1（start.bat / start.sh 已设置）
+#   - 命令行 --standalone
+#   - 冻结后的独立桌面版（PyInstaller onefile）：始终为独立模式。
+#     该二进制只在 Windows/Linux 桌面运行，绝不会运行在 fnOS 内部
+#     （fnOS 走 .fpk + 系统 Python，不会以冻结形式执行），因此可直接判定为独立模式，
+#     这样用户直接双击 video-tool.exe 也能获得正确的桌面体验，而不是退化成 fnOS 模式。
+_FROZEN = getattr(sys, "frozen", False)
+_STANDALONE_ENV = os.environ.get("VT_STANDALONE", "").lower()
+STANDALONE = _STANDALONE_ENV in ("1", "true", "yes", "on") or _FROZEN
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.4"
 PROJECT_URL = "https://github.com/qianliaa/video-tool"
 GITHUB_REPO = "qianliaa/video-tool"
 PUBLISHER = "千里"
@@ -601,12 +609,22 @@ def release_output(path):
 
 
 def output_path(state, name, default_ext=".mkv"):
-    require_output_dir(state)
-    name = safe_name(name, default_ext)
-    base = real(state["output_dir"])
-    path = real(os.path.join(base, name))
-    if path != base and not path.startswith(base + os.sep):
-        raise ValueError("输出路径超出输出目录")
+    if STANDALONE and os.path.isabs(name):
+        # 独立（桌面）模式：允许直接指定绝对输出路径，无需先设置输出目录。
+        path = real(name)
+        if not os.path.splitext(path)[1]:
+            path += default_ext
+    else:
+        name = safe_name(name, default_ext)
+        if STANDALONE:
+            # 独立模式相对名 → 落到当前工作目录
+            path = real(os.path.join(os.getcwd(), name))
+        else:
+            require_output_dir(state)
+            base = real(state["output_dir"])
+            path = real(os.path.join(base, name))
+            if path != base and not path.startswith(base + os.sep):
+                raise ValueError("输出路径超出输出目录")
     require_user_path(state, path, "输出路径")
     parent = os.path.dirname(path)
     if parent:
@@ -634,6 +652,13 @@ def output_path(state, name, default_ext=".mkv"):
 def input_path(state, value):
     if not value:
         raise ValueError("请选择输入文件")
+    if STANDALONE and os.path.isabs(value):
+        # 独立（桌面）模式：允许直接指定绝对输入路径，无需先设置输入目录。
+        path = real(value)
+        require_user_path(state, path, "输入文件")
+        if not os.path.isfile(path):
+            raise ValueError("输入文件不存在：%s" % value)
+        return path
     require_input_dir(state)
     base = real(state["input_dir"])
     path = real(value if os.path.isabs(value) else os.path.join(base, value))
@@ -779,40 +804,238 @@ def parse_progress(task, line):
             task["progress"] = min(99.0, secs / task["duration"] * 100.0)
 
 
+def set_process_suspended(proc, suspend):
+    """挂起/恢复外部进程；排队中的任务不需要调用它，由 run_task 自行等待。
+
+    POSIX 使用 SIGSTOP/SIGCONT；Windows 使用 ntdll!NtSuspendProcess /
+    NtResumeProcess（只需 PROCESS_SUSPEND_RESUME 权限，对本进程创建的子进程可用）。
+    任何失败都返回 False，由调用方决定是否跳过该任务。
+    """
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        if os.name == "posix":
+            import signal
+            os.kill(proc.pid, signal.SIGSTOP if suspend else signal.SIGCONT)
+            return True
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = k32.OpenProcess(0x0800, False, int(proc.pid))  # PROCESS_SUSPEND_RESUME
+            if not handle:
+                return False
+            try:
+                fn = ntdll.NtSuspendProcess if suspend else ntdll.NtResumeProcess
+                fn.argtypes = [wintypes.HANDLE]
+                fn.restype = ctypes.c_long  # NTSTATUS
+                return fn(handle) == 0     # STATUS_SUCCESS
+            finally:
+                k32.CloseHandle(handle)
+    except Exception:
+        return False
+    return False
+
+
+def task_view_status(task):
+    """对外展示的状态：paused 优先于内部的 running / queued。"""
+    return "paused" if task.get("paused") else task["status"]
+
+
+def _owned_task(task_id, owner):
+    task = TASKS.get(task_id)
+    if not task or task.get("deleted") or (owner is not None and task.get("owner") != owner):
+        return None
+    return task
+
+
+def pause_task(task_id, owner=None):
+    """暂停排队中或运行中的任务。返回值：ok / skipped:原因 / not_found。"""
+    with TASKS_LOCK:
+        task = _owned_task(task_id, owner)
+        if not task:
+            return "not_found"
+        if task.get("paused"):
+            return "skipped:任务已暂停"
+        if task["status"] not in ("queued", "running"):
+            return "skipped:任务已结束"
+        proc = task.get("proc")
+    # 运行中的任务需要真正挂起外部进程；挂起失败则不改状态，避免假暂停。
+    if proc is not None and proc.poll() is None:
+        if not set_process_suspended(proc, True):
+            return "skipped:当前系统无法挂起运行中的进程"
+    with TASKS_LOCK:
+        if task["status"] not in ("queued", "running", "paused"):
+            set_process_suspended(proc, False)
+            return "skipped:任务已结束"
+        task["paused"] = True
+        task["status"] = "paused"
+    return "ok"
+
+
+def resume_task(task_id, owner=None):
+    """继续被暂停的任务。"""
+    with TASKS_LOCK:
+        task = _owned_task(task_id, owner)
+        if not task:
+            return "not_found"
+        if not task.get("paused"):
+            return "skipped:任务未暂停"
+        proc = task.get("proc")
+    if proc is not None and proc.poll() is None:
+        if not set_process_suspended(proc, False):
+            return "skipped:恢复进程失败"
+    with TASKS_LOCK:
+        task["paused"] = False
+        # 有进程 = 运行中任务被挂起；无进程 = 排队阶段挂起，重新参与抢槽位。
+        task["status"] = "running" if (proc is not None and proc.poll() is None) else "queued"
+    return "ok"
+
+
+def restart_task(task_id, owner=None):
+    """重新执行已结束（完成 / 失败 / 已取消）的任务，即从命令行重新跑一遍。"""
+    with TASKS_LOCK:
+        task = _owned_task(task_id, owner)
+        if not task:
+            return "not_found"
+        if (task.get("paused") or task["status"] in ("queued", "running")
+                or task.get("proc") is not None or task.get("finished") is None):
+            return "skipped:任务尚未结束"
+        spec = task.get("exec") or {}
+        if not spec.get("cmd"):
+            return "skipped:缺少执行参数，无法重试"
+        cmd = list(spec["cmd"])
+        duration = spec.get("duration")
+        cleanup = spec.get("cleanup")
+        partial = spec.get("partial")
+        task.update({
+            "status": "queued",
+            "paused": False,
+            "canceled": False,
+            "finished": None,
+            "returncode": None,
+            "proc": None,
+            "run_token": uuid.uuid4().hex,
+            "written": 0,
+            "elapsed": 0.0,
+            "progress": 0.0 if (duration or task.get("total_bytes")) else -1.0,
+            "created": time.time(),
+        })
+        log_line(task, "任务重新开始（重试）")
+    threading.Thread(target=run_task, args=(task_id, cmd, duration, cleanup, partial),
+                     daemon=True).start()
+    return "ok"
+
+
+def start_saved_task(task_id, owner=None):
+    """「开始」按钮：暂停任务→继续；已结束任务→重试；运行/排队中→跳过。"""
+    with TASKS_LOCK:
+        task = _owned_task(task_id, owner)
+        if not task:
+            return "not_found"
+        if task.get("paused"):
+            action = "resume"
+        elif task["status"] in ("queued", "running"):
+            return "skipped:任务已在运行"
+        else:
+            action = "restart"
+    return resume_task(task_id, owner) if action == "resume" else restart_task(task_id, owner)
+
+
+def delete_task(task_id, owner=None):
+    """删除任务记录；活动任务先取消，再由任务线程在收尾时从 TASKS 移除。"""
+    with TASKS_LOCK:
+        task = _owned_task(task_id, owner)
+        if not task:
+            return "not_found"
+        proc = task.get("proc")
+        active = task["status"] in ("queued", "running", "paused") or proc is not None
+        if not active:
+            TASKS.pop(task_id, None)
+            return "ok"
+        was_paused = bool(task.get("paused"))
+        task["deleted"] = True
+        task["canceled"] = True
+        task["paused"] = False
+        task["status"] = "canceled"
+    if proc is not None:
+        if was_paused:
+            set_process_suspended(proc, False)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        for _ in range(20):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    return "ok"
+
+
 def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
     with TASKS_LOCK:
         task = TASKS[task_id]
         task["duration"] = duration
+        run_token = task.get("run_token")
     acquired = False
     # 下载走独立队列，不与转码争 CPU 槽位；两类任务可以各自并行。
     slots = DOWNLOAD_SLOTS if task.get("action") == "download" else TASK_SLOTS
     try:
         # 并发槽位：超出的任务排队，避免多个 libx264 同时打满 NAS CPU。
-        # 等待期间持续检查取消标记，让排队中的任务可以被立即取消。
+        # 等待期间持续检查取消 / 删除 / 暂停标记；暂停时释放槽位让给其它任务。
+        proc = None
         while True:
-            if slots.acquire(timeout=0.2):
-                acquired = True
-                break
             with TASKS_LOCK:
-                if task.get("canceled"):
+                if task.get("run_token") != run_token:
+                    return
+                if task.get("canceled") or task.get("deleted"):
                     task["status"] = "canceled"
                     task["finished"] = time.time()
                     return
-        with TASKS_LOCK:
-            if task.get("canceled"):
-                task["status"] = "canceled"
-                task["finished"] = time.time()
-                return
-            task["status"] = "running"
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            bufsize=0,
-        )
-        with TASKS_LOCK:
-            task["proc"] = proc
+                if task.get("paused"):
+                    if acquired:
+                        try:
+                            slots.release()
+                        except ValueError:
+                            pass
+                        acquired = False
+                    task["status"] = "paused"
+                    wait_paused = True
+                else:
+                    if task["status"] == "paused":
+                        task["status"] = "queued"
+                    wait_paused = False
+            if wait_paused:
+                time.sleep(0.2)
+                continue
+            if not acquired:
+                acquired = slots.acquire(timeout=0.2)
+                continue
+            # 已拿到槽位：与「暂停」操作做一次原子检查后再启动进程，
+            # 避免暂停请求刚好落在启动窗口里导致进程实际仍在运行。
+            with TASKS_LOCK:
+                if (task.get("run_token") != run_token or task.get("canceled")
+                        or task.get("deleted") or task.get("paused")):
+                    continue
+                task["status"] = "running"
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                task["proc"] = proc
+            break
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         pending = ""
         while True:
@@ -845,14 +1068,21 @@ def run_task(task_id, cmd, duration=None, cleanup=None, partial=None):
             task["status"] = "failed"
     finally:
         with TASKS_LOCK:
-            task["finished"] = time.time()
-            task["proc"] = None
-            failed = task.get("status") != "done"
+            # run_token 变化说明该任务已被「重新开始」，旧线程不得覆盖新一轮状态。
+            stale = task.get("run_token") != run_token
+            if not stale:
+                task["finished"] = time.time()
+                task["proc"] = None
+                failed = task.get("status") != "done"
+                if task.get("deleted"):
+                    TASKS.pop(task_id, None)
         if acquired:
             try:
                 slots.release()
             except ValueError:
                 pass
+        if stale:
+            return
         release_output(task.get("output"))
         if cleanup:
             for p in cleanup:
@@ -886,6 +1116,15 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         "returncode": None,
         "proc": None,
         "canceled": False,
+        # 批量操作状态：paused=暂停中，deleted=已从界面移除（线程收尾时清理），
+        # exec=重试所需的原始执行参数，run_token 用于区分同一任务的多次执行。
+        "paused": False,
+        "deleted": False,
+        "run_token": uuid.uuid4().hex,
+        "exec": {
+            "cmd": list(cmd), "duration": duration, "cleanup": cleanup,
+            "partial": partial, "total_bytes": total_bytes,
+        },
         "duration": duration,
         "total_bytes": total_bytes,
         "written": 0,
@@ -901,7 +1140,9 @@ def start_task(tool, action, cmd, duration=None, cleanup=None, note=None,
         if len(TASKS) > 60:
             stale = sorted(TASKS.values(), key=lambda t: t["created"])[:20]
             for t in stale:
-                if t["status"] != "running":
+                # 排队 / 运行中 / 暂停中 / 待删除的任务不能被自动清理。
+                if (t.get("proc") is None and not t.get("deleted")
+                        and t["status"] not in ("queued", "running", "paused")):
                     TASKS.pop(t["id"], None)
     log_line(task, "$ " + task["cmd"])
     if note:
@@ -917,17 +1158,22 @@ def cancel_task(task_id):
         if not task:
             return False
         proc = task.get("proc")
+        was_paused = bool(task.get("paused"))
         task["canceled"] = True
-        if task.get("status") == "queued":
+        task["paused"] = False
+        # 排队（含暂停）中的任务：线程会在下一轮自行退出。
+        if task.get("status") in ("queued", "paused"):
             task["status"] = "canceled"
             task["finished"] = time.time()
             return True
-        if proc:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-    if proc:
+    if proc is not None:
+        # POSIX 下 SIGTERM 对 SIGSTOP 挂起的进程不会立即生效，必须先恢复。
+        if was_paused:
+            set_process_suspended(proc, False)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
         for _ in range(20):
             if proc.poll() is not None:
                 break
@@ -1124,7 +1370,10 @@ def build_ffmpeg(state, action, p):
         sub = p.get("subtitle")
         if not sub:
             raise ValueError("请选择字幕文件")
-        sub = real(sub if os.path.isabs(sub) else os.path.join(state["input_dir"], sub))
+        if STANDALONE and os.path.isabs(sub):
+            sub = real(sub)
+        else:
+            sub = real(sub if os.path.isabs(sub) else os.path.join(state["input_dir"], sub))
         if not within_roots(state, sub) or not os.path.isfile(sub):
             raise ValueError("字幕文件不存在或不可访问")
         out = output_path(state, p.get("output"), ".mp4")
@@ -1530,7 +1779,13 @@ def build_download(state, p):
     proxy = validate_proxy((p.get("proxy") or "").strip())
 
     ffmpeg = require_ffmpeg()
-    require_output_dir(state)
+    save_dir = (p.get("save_dir") or "").strip()
+    if STANDALONE and save_dir and os.path.isabs(save_dir):
+        # 独立模式：允许直接指定绝对保存目录，无需先设置输出目录
+        base = real(save_dir)
+        require_user_path(state, base, "保存目录")
+    else:
+        require_output_dir(state)
 
     headers = download_headers(p)
     media_url, kind, title = resolve_media(url, headers, proxy)
@@ -1574,7 +1829,11 @@ def build_download(state, p):
     subdir = (p.get("subdir") or "").strip().replace("\\", "/").strip("/")
     if subdir.startswith("/") or ".." in subdir.split("/"):
         raise ValueError("子目录不合法")
-    target = (subdir + "/" if subdir else "") + filename
+    if STANDALONE and save_dir and os.path.isabs(save_dir):
+        # 独立模式：直接落到用户指定的绝对保存目录
+        target = real(os.path.join(real(save_dir), filename))
+    else:
+        target = (subdir + "/" if subdir else "") + filename
     out = output_path(state, target, ".mp3" if mode == "audio" else ".mp4")
 
     cmd = [ffmpeg, "-hide_banner", "-y", "-nostdin", "-loglevel", "info",
@@ -2142,14 +2401,15 @@ class Handler(BaseHTTPRequestHandler):
         with TASKS_LOCK:
             items = []
             for task in sorted(TASKS.values(), key=lambda t: t["created"], reverse=True):
-                if task.get("owner") != state["key"]:
+                if task.get("owner") != state["key"] or task.get("deleted"):
                     continue
                 items.append({
                     "id": task["id"],
                     "tool": task["tool"],
                     "action": task["action"],
                     "name": task.get("name") or "",
-                    "status": task["status"],
+                    "status": task_view_status(task),
+                    "paused": bool(task.get("paused")),
                     "progress": task["progress"],
                     "written": task.get("written", 0),
                     "elapsed": task.get("elapsed", 0.0),
@@ -2170,7 +2430,7 @@ class Handler(BaseHTTPRequestHandler):
             since = 0
         with TASKS_LOCK:
             task = TASKS.get(task_id)
-            if not task or task.get("owner") != state["key"]:
+            if not task or task.get("deleted") or task.get("owner") != state["key"]:
                 self.send_json({"error": "任务不存在"}, 404)
                 return
             log_start = int(task.get("log_start") or 0)
@@ -2178,7 +2438,7 @@ class Handler(BaseHTTPRequestHandler):
             chunk = list(task["log"][max(0, since - log_start):])
             payload = {
                 "id": task["id"],
-                "status": task["status"],
+                "status": task_view_status(task),
                 "progress": task["progress"],
                 "written": task.get("written", 0),
                 "elapsed": task.get("elapsed", 0.0),
@@ -2201,6 +2461,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.api_mkdir()
             elif path == "/api/task":
                 self.api_task()
+            elif path == "/api/tasks/batch":
+                self.api_batch()
             elif path.startswith("/api/cancel/"):
                 self.api_cancel(path[len("/api/cancel/"):])
             else:
@@ -2310,7 +2572,7 @@ class Handler(BaseHTTPRequestHandler):
         state = self.current_user()
         with TASKS_LOCK:
             task = TASKS.get(task_id)
-            if not task or task.get("owner") != state["key"]:
+            if not task or task.get("deleted") or task.get("owner") != state["key"]:
                 self.send_json({"error": "任务不存在"}, 404)
                 return
         ok = cancel_task(task_id)
@@ -2319,11 +2581,60 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json({"ok": True})
 
+    def api_batch(self):
+        """任务列表批量操作：start(继续/重试) / pause / cancel / delete。"""
+        state = self.current_user()
+        data = self.read_json()
+        op = (data.get("op") or "").strip()
+        ids = data.get("ids")
+        if op not in ("start", "pause", "cancel", "delete"):
+            raise ValueError("不支持的批量操作：%s" % (op or "空"))
+        if not isinstance(ids, list):
+            raise ValueError("ids 必须是任务 ID 数组")
+        seen = set()
+        task_ids = []
+        for raw in ids:
+            tid = str(raw) if isinstance(raw, (str, int)) else ""
+            if tid and tid not in seen:
+                seen.add(tid)
+                task_ids.append(tid)
+        if len(task_ids) > 100:
+            raise ValueError("一次最多操作 100 个任务")
+
+        results = {}
+        applied = 0
+        for tid in task_ids:
+            if op == "start":
+                res = start_saved_task(tid, state["key"])
+            elif op == "pause":
+                res = pause_task(tid, state["key"])
+            elif op == "delete":
+                res = delete_task(tid, state["key"])
+            else:
+                with TASKS_LOCK:
+                    task = _owned_task(tid, state["key"])
+                    active = bool(task and (task["status"] in ("queued", "running")
+                                            or task.get("paused")))
+                if not task:
+                    res = "not_found"
+                elif not active:
+                    res = "skipped:任务已结束"
+                else:
+                    res = "ok" if cancel_task(tid) else "not_found"
+            results[tid] = res
+            if res == "ok":
+                applied += 1
+        self.send_json({"ok": True, "op": op, "applied": applied,
+                        "skipped": len(results) - applied, "results": results})
+
 
 def stop_all_tasks():
     with TASKS_LOCK:
-        procs = [t.get("proc") for t in TASKS.values() if t.get("proc")]
-    for proc in procs:
+        pairs = [(t.get("paused"), t.get("proc")) for t in TASKS.values() if t.get("proc")]
+    for was_paused, proc in pairs:
+        # 挂起中的进程先恢复，否则 POSIX 下 SIGTERM 要等 SIGCONT 才生效。
+        if was_paused:
+            set_process_suspended(proc, False)
         try:
             proc.terminate()
         except OSError:
@@ -2358,14 +2669,21 @@ def _startup_fail(problems):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default=os.environ.get("VT_BIND_HOST") or "0.0.0.0")
+    # 桌面独立版（冻结）默认只监听本机回环地址，避免无意识暴露到局域网；
+    # fnOS / Docker 仍默认 0.0.0.0，由飞牛或反代决定对外暴露。
+    _default_host = os.environ.get("VT_BIND_HOST") or ("127.0.0.1" if _FROZEN else "0.0.0.0")
+    parser.add_argument("--host", default=_default_host)
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("VT_BIND_PORT") or "18080"))
     parser.add_argument("--standalone", action="store_true",
                         help="独立模式：绕过 fnOS 授权，允许选择本机任意目录（Win/Linux 桌面）")
     parser.add_argument("--open", action="store_true",
                         help="启动后自动打开默认浏览器")
+    parser.add_argument("--no-open", action="store_true",
+                        help="不自动打开浏览器（桌面独立版默认会自动打开面板）")
     args = parser.parse_args()
+    # 桌面独立版（冻结）默认自动打开浏览器面板；可用 --no-open 关闭。
+    open_browser = bool(args.open or (_FROZEN and not args.no_open))
 
     global STANDALONE
     if args.standalone:
@@ -2431,14 +2749,19 @@ def main():
         stop_all_tasks()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+    except (ValueError, OSError):
+        # 非主线程（被桌面面板以线程方式启动）无法注册信号，忽略即可；
+        # 进程退出由面板“退出”按钮统一处理。fnOS / Docker 在主线程运行，不受影响。
+        pass
 
     _startup_log("已监听 %s:%d" % (args.host, args.port))
     if args.host not in ("127.0.0.1", "::1", "localhost", ""):
         _startup_log("NOTE: 当前监听非回环地址，局域网内可直接访问且无需登录。")
 
-    if args.open:
+    if open_browser:
         import webbrowser
         open_host = "127.0.0.1" if args.host in ("0.0.0.0", "") else args.host
         open_url = "http://%s:%d/" % (open_host, args.port)

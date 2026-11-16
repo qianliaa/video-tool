@@ -24,6 +24,7 @@
     dlMode: "video",
     picker: { mode: "input", path: "", parent: null },
     tasks: [],
+    selected: {},
     seen: {},
     logId: null,
     logTimer: null,
@@ -61,7 +62,11 @@
     download: "链接下载"
   };
 
-  var STATUS_LABEL = { queued: "排队中", running: "运行中", done: "已完成", failed: "失败", canceled: "已取消" };
+  var STATUS_LABEL = {
+    queued: "排队中", running: "运行中", paused: "已暂停",
+    done: "已完成", failed: "失败", canceled: "已取消"
+  };
+  var BATCH_LABEL = { start: "开始 / 继续", pause: "暂停", cancel: "取消", delete: "删除" };
 
   // ---------------------------------------------------------------- 基础
 
@@ -774,22 +779,90 @@
       item.className = "task-item " + t.status;
       var unknown = Number(t.progress) < 0;
       var pct = unknown ? 0 : Math.max(0, Math.min(100, Number(t.progress) || 0));
+      var active = t.status === "running" || t.status === "queued" || t.status === "paused";
       item.innerHTML =
         '<div class="task-top">' +
+          '<label class="task-check" title="选择任务"><input type="checkbox" data-check="' + esc(t.id) + '"' +
+            (state.selected[t.id] ? ' checked' : '') + '></label>' +
           '<span class="task-name">' + esc(taskName(t)) + '</span>' +
           (t.name ? '<span class="task-kind">' + esc(taskLabel(t)) + '</span>' : '') +
           '<span class="status ' + esc(t.status) + '">' + esc(STATUS_LABEL[t.status] || t.status) + '</span>' +
-          (t.status === "running" ? '<span class="task-time">' + esc(unknown ? taskStat(t) : pct.toFixed(0) + "%") + '</span>' : '') +
+          ((t.status === "running" || t.status === "paused") ? '<span class="task-time">' + esc(unknown ? taskStat(t) : pct.toFixed(0) + "%") + '</span>' : '') +
           '<span class="task-time">' + esc(fmtDate(t.created)) + '</span>' +
           '<span class="task-actions">' +
             '<button class="btn ghost small" data-log="' + esc(t.id) + '">日志</button>' +
-            ((t.status === "running" || t.status === "queued") ? '<button class="btn danger small" data-cancel="' + esc(t.id) + '">取消</button>' : '') +
+            (active ? '<button class="btn danger small" data-cancel="' + esc(t.id) + '">取消</button>' : '') +
           '</span>' +
         '</div>' +
         '<div class="progress"><div class="progress-bar' + (unknown ? ' unknown' : '" style="width:' + pct + '%') + '"></div></div>';
       box.appendChild(item);
     });
     $("#tasksEmpty").hidden = state.tasks.length > 0;
+    updateBatchBar();
+  }
+
+  function selectedTaskIds() {
+    var ids = [];
+    state.tasks.forEach(function (t) { if (state.selected[t.id]) ids.push(t.id); });
+    return ids;
+  }
+
+  function updateBatchBar() {
+    var ids = state.tasks.map(function (t) { return t.id; });
+    var n = selectedTaskIds().length;
+    var info = $("#taskSelectedCount");
+    if (info) info.textContent = "已选 " + n + " 项";
+    var all = $("#taskSelectAll");
+    if (all) {
+      all.checked = ids.length > 0 && n === ids.length;
+      all.indeterminate = n > 0 && n < ids.length;
+    }
+    $$("[data-batch]").forEach(function (btn) { btn.disabled = n === 0; });
+  }
+
+  function runBatch(op, ids) {
+    if (!ids.length) { toast("请先勾选任务", "error"); return; }
+    var label = BATCH_LABEL[op] || op;
+    var active = ids.filter(function (id) {
+      var t = null;
+      state.tasks.forEach(function (x) { if (x.id === id) t = x; });
+      return t && (t.status === "queued" || t.status === "running" || t.status === "paused");
+    }).length;
+    if (op === "cancel" && !window.confirm("确定取消选中的 " + ids.length + " 个任务吗？")) return;
+    if (op === "delete" && !window.confirm(
+        "确定删除选中的 " + ids.length + " 个任务吗？" +
+        (active ? "\n其中 " + active + " 个正在运行或排队，会先取消再移除记录。" : "\n仅移除任务记录，不会删除已生成的文件。"))) return;
+    post("/api/tasks/batch", { op: op, ids: ids }).then(function (data) {
+      var skipped = Number(data.skipped) || 0;
+      var reason = "";
+      if (skipped && data.results) {
+        Object.keys(data.results).some(function (id) {
+          var r = String(data.results[id] || "");
+          if (r.indexOf("skipped:") === 0) { reason = r.slice(8); return true; }
+          return false;
+        });
+      }
+      toast(label + "：成功 " + data.applied + " 项" + (skipped ? "，跳过 " + skipped + " 项" : "") +
+            (reason ? "（" + reason + "）" : ""),
+            (data.applied ? "success" : "error"), 4000);
+      loadTasks(true);
+    }).catch(function (err) {
+      toast(label + "失败：" + err.message, "error", 6000);
+    });
+  }
+
+  function clearFinishedTasks() {
+    var ids = state.tasks.filter(function (t) {
+      return t.status === "done" || t.status === "failed" || t.status === "canceled";
+    }).map(function (t) { return t.id; });
+    if (!ids.length) { toast("没有已结束的任务", "error"); return; }
+    if (!window.confirm("确定清除 " + ids.length + " 条已结束的任务记录吗？不会删除已生成的文件。")) return;
+    post("/api/tasks/batch", { op: "delete", ids: ids }).then(function (data) {
+      toast("已清除 " + data.applied + " 条记录", "success");
+      loadTasks(true);
+    }).catch(function (err) {
+      toast("清除失败：" + err.message, "error");
+    });
   }
 
   function loadTasks(silent) {
@@ -797,9 +870,15 @@
       var prev = {};
       state.tasks.forEach(function (t) { prev[t.id] = t.status; });
       state.tasks = data.tasks || [];
+      // 已被后端删除的任务不再保留勾选状态
+      var valid = {};
+      state.tasks.forEach(function (t) { valid[t.id] = 1; });
+      Object.keys(state.selected).forEach(function (id) {
+        if (!valid[id]) delete state.selected[id];
+      });
       state.tasks.forEach(function (t) {
         var before = prev[t.id];
-        if ((before === "running" || before === "queued") &&
+        if ((before === "running" || before === "queued" || before === "paused") &&
             (t.status === "done" || t.status === "failed" || t.status === "canceled")) {
           if (t.status === "done") {
             toast(taskName(t) + " 已完成", "success");
@@ -1304,6 +1383,30 @@
       var cancelBtn = e.target.closest("[data-cancel]");
       if (cancelBtn) cancelTask(cancelBtn.getAttribute("data-cancel"), false);
     });
+    $("#taskList").addEventListener("change", function (e) {
+      var box = e.target.closest("[data-check]");
+      if (!box) return;
+      var id = box.getAttribute("data-check");
+      if (box.checked) state.selected[id] = true;
+      else delete state.selected[id];
+      updateBatchBar();
+    });
+    $("#taskSelectAll").addEventListener("change", function (e) {
+      state.tasks.forEach(function (t) {
+        if (e.target.checked) state.selected[t.id] = true;
+        else delete state.selected[t.id];
+      });
+      renderTasks();
+    });
+    $$("[data-batch]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        runBatch(btn.getAttribute("data-batch"), selectedTaskIds());
+      });
+    });
+    if ($("#tasksClearDone")) {
+      $("#tasksClearDone").addEventListener("click", clearFinishedTasks);
+    }
+    updateBatchBar();
   }
 
   function bindSettings() {
