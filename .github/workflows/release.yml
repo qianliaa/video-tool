@@ -216,7 +216,7 @@ jobs:
             echo
             echo "- Windows：下载 \`${WIN}\`，解压后双击 \`start.bat\`（已内置 ffmpeg，无需安装 Python）"
             echo "- Linux：下载 \`${LINUX}\`，解压后运行 \`./start.sh\`（已内置 ffmpeg）"
-            echo "- 双击 exe 即弹出原生操作面板（不弹浏览器、不联网）；如需 Web 界面可手动打开 \`http://127.0.0.1:18080/\""
+            echo "- 双击 exe 即弹出原生操作面板（不弹浏览器、不联网）；如需 Web 界面可手动打开 \`http://127.0.0.1:18080/\`"
             echo "- Windows SHA-256：\`${WIN_SHA}\`"
             echo "- Linux SHA-256：\`${LINUX_SHA}\`"
             echo
